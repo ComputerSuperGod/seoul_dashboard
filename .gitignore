@@ -1,11 +1,13 @@
-
 # secrets
 .env
+
 # python
 __pycache__/
 *.pyc
+
+# streamlit
+.streamlit/
+
 # os
 .DS_Store
 Thumbs.db
-# streamlit.streamlit/
-
