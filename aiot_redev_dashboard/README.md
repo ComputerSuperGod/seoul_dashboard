@@ -1,3 +1,5 @@
+
+```
 aiot_redev_dashboard/
  ┣ app/
  │  └─ app.py
@@ -8,4 +10,4 @@ aiot_redev_dashboard/
  ┣ .gitignore
  ┗ .gitattributes
 
-
+```
