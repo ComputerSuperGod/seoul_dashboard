@@ -1,5 +1,0 @@
-﻿__pycache__/
-.streamlit/
-geocode_cache.csv
-*.pyc
-.DS_Store
