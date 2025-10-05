@@ -12,12 +12,110 @@ import altair as alt
 from datetime import datetime
 from pathlib import Path
 
+# 🔤 안전한 CSV 로더: 여러 인코딩 시도
+def smart_read_csv(path, encodings=("utf-8-sig", "cp949", "euc-kr", "utf-8", "latin1")):
+    import pandas as pd
+    last_err = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            try:
+                import streamlit as st
+                st.caption(f"📄 Loaded {path.name} with encoding = **{enc}**")
+            except Exception:
+                pass
+            return df
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+    # 최후 수단: errors='replace' 로라도 읽기
+    try:
+        df = pd.read_csv(path, encoding="utf-8", errors="replace")
+        return df
+    except Exception:
+        raise last_err or Exception(f"Failed to read {path} with tried encodings.")
+
+
+
 # -------------------------------------------------------------
 # ✅ 프로젝트 루트 기준 경로 자동 설정
 # -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 CSV_PATH = BASE_DIR / "data" / "seoul_redev_projects.csv"
 CSV_ENCODING = "cp949"
+
+# -------------------------------------------------------------
+# 📦 좌표 CSV 병합 유틸
+# -------------------------------------------------------------
+COORD_CSV_PATH = BASE_DIR / "data" / "서울시_재개발재건축_좌표포함.csv"
+COORD_ENCODING = "cp949"
+
+@st.cache_data(show_spinner=False)
+def load_coords() -> pd.DataFrame:
+    df = smart_read_csv(COORD_CSV_PATH)
+    df["lat"] = pd.to_numeric(df.get("lat"), errors="coerce")
+    df["lon"] = pd.to_numeric(df.get("lon"), errors="coerce")
+
+    def _coalesce(*vals):
+        for v in vals:
+            if pd.notna(v) and str(v).strip():
+                return v
+        return None
+
+    df_norm = pd.DataFrame({
+        "apt_id": df.get("사업번호").astype(str) if "사업번호" in df.columns else None,
+        "name": [_coalesce(n, m) for n, m in zip(df.get("정비구역명칭"), df.get("추진위원회/조합명"))],
+        "gu": df.get("자치구"),
+        "address": [_coalesce(a, b) for a, b in zip(df.get("정비구역위치"), df.get("대표지번"))],
+        "lat": df["lat"],
+        "lon": df["lon"],
+    })
+    df_norm["apt_id"] = df_norm["apt_id"].fillna("").astype(str)
+    df_norm["name"] = df_norm["name"].fillna("")
+    df_norm["address"] = df_norm["address"].fillna("")
+    return df_norm
+
+
+# 서울 자치구 중심좌표 (간이값)
+GU_CENTER = {
+    "강남구": (37.5172, 127.0473),
+    "서초구": (37.4836, 127.0326),
+    "송파구": (37.5145, 127.1068),
+    "영등포구": (37.5264, 126.8963),
+    "마포구": (37.5638, 126.9084),
+    "성동구": (37.5633, 127.0369),
+    "관악구": (37.4784, 126.9516),
+    "구로구": (37.4955, 126.8876),
+}
+
+
+@st.cache_data(show_spinner=False)
+def merge_projects_with_coords(gu: str) -> pd.DataFrame:
+    # 1) 원본 로드 + 스키마 통일
+    raw = load_raw_csv()
+    proj = normalize_schema(raw)              # ✅ apt_id, name, gu, address, households, land_area_m2 생성
+    proj = proj[proj["gu"] == gu].copy()
+
+    # 2) 좌표 로드
+    coords = load_coords()
+    coords = coords[coords["gu"] == gu].copy()
+
+    # 3) 병합: 우선 name→(보강 필요 시) apt_id/address 키 확장 가능
+    out = proj.merge(coords[["name","lat","lon"]], on="name", how="left")
+
+    # 4) 좌표 결측 보정 (구 중심 + 지터)
+    missing = out["lat"].isna() | out["lon"].isna()
+    base_lat, base_lon = GU_CENTER.get(gu, (37.55, 127.0))
+    rng = np.random.default_rng(42)
+    jitter = lambda n: rng.normal(0, 0.002, n)  # ≈ 200m 분산
+    if missing.any():
+        n = int(missing.sum())
+        out.loc[missing, "lat"] = base_lat + jitter(n)
+        out.loc[missing, "lon"] = base_lon + jitter(n)
+    out["has_geo"] = ~missing
+
+    return out.reset_index(drop=True)
+
 
 # -------------------------------------------------------------
 # ⚙️ Streamlit 기본 설정
@@ -43,9 +141,12 @@ st.markdown(STYLE, unsafe_allow_html=True)
 # 🧾 CSV 로드 & 전처리
 # -------------------------------------------------------------
 @st.cache_data(show_spinner=False)
+# -------------------------------------------------------------
+# 🧾 CSV 로드 & 전처리
+# -------------------------------------------------------------
+@st.cache_data(show_spinner=False)
 def load_raw_csv() -> pd.DataFrame:
-    df = pd.read_csv(CSV_PATH, encoding=CSV_ENCODING)
-    return df
+    return smart_read_csv(CSV_PATH)  # ✅ 인코딩 자동 감지 사용
 
 def _coalesce(*vals):
     for v in vals:
@@ -114,6 +215,7 @@ GU_CENTER = {
     "중랑구": (37.6063, 127.0929),
 }
 
+
 def attach_latlon_by_gu_centroid(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["lat"] = df["gu"].map(lambda g: GU_CENTER.get(g, (37.55, 127.0))[0]) + np.random.normal(scale=0.004, size=len(df))
@@ -142,7 +244,8 @@ with col12_left:
     st.markdown("### 🗺 1-2사분면 · 지도 & 단지선택")
 
     base_df = get_projects_by_gu(selected_gu)
-    df_map = attach_latlon_by_gu_centroid(base_df)
+    df_map = merge_projects_with_coords(selected_gu)
+
 
     # 지도 자리만 먼저 확보 (필터/선택 적용 후 아래에서 실제 차트 렌더)
     map_slot = st.empty()
