@@ -3,3 +3,12 @@ requests
 python-dotenv
 pyarrow
 
+geopandas
+shapely
+fiona
+pyproj
+rtree
+
+matplotlib
+
+openpyxl

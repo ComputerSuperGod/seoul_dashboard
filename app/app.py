@@ -4,13 +4,52 @@
 # 📊 CSV 기반 데이터 반영 버전
 # -------------------------------------------------------------
 
+# --- must come first: add project root to sys.path BEFORE importing utils ---
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent  # .../seoul_dashboard_3
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+# ---------------------------------------------------------------------------
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pydeck as pdk
 import altair as alt
 from datetime import datetime
-from pathlib import Path
+
+# === 외부 모듈 (utils) 임포트 ===
+from utils.traffic_preproc import ensure_speed_csv
+
+# Altair/MPL/Plotly 스위치형: plot_speed가 없거나 로딩 실패하면 기존 함수로 폴백
+try:
+    from utils.traffic_plot import plot_speed
+    _HAS_PLOT_SPEED = True
+except Exception as e:
+    print("utils.traffic_plot import fallback:", e)
+    from utils.traffic_plot import plot_nearby_speed_from_csv
+    _HAS_PLOT_SPEED = False
+
+# === 데이터 디렉터리 ===
+DATA_DIR = BASE_DIR / "data"
+
+# === 데이터 파일 경로 (이름 충돌 방지: 변수명 구분) ===
+BASE_YEAR = 2023   # 24년으로 바꿔도 됨
+
+# 재건축 프로젝트 원본 CSV (당신의 app에서 쓰던 표 데이터)
+PROJECTS_CSV_PATH = DATA_DIR / "seoul_redev_projects.csv"
+
+# 교통 기준년도 데이터 (엑셀 → CSV 자동 변환 대상)
+TRAFFIC_XLSX_PATH = DATA_DIR / "AverageSpeed(LINK).xlsx"
+TRAFFIC_CSV_PATH  = DATA_DIR / f"AverageSpeed_Seoul_{BASE_YEAR}.csv"
+
+# 도로망 레벨6 쉐이프
+SHP_PATH = DATA_DIR / "seoul_link_lev6_2023.shp"
+
+
+
 #===========================캐시 비우기=================
 
 
@@ -157,7 +196,8 @@ st.markdown(STYLE, unsafe_allow_html=True)
 # -------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_raw_csv() -> pd.DataFrame:
-    return smart_read_csv(CSV_PATH)  # ✅ 인코딩 자동 감지 사용
+    return smart_read_csv(PROJECTS_CSV_PATH)  # ✅ 인코딩 자동 감지 사용
+
 
 def _coalesce(*vals):
     for v in vals:
@@ -645,6 +685,7 @@ with col12_left:
         map_slot.pydeck_chart(
             pdk.Deck(
                 layers=[layer_highlight],
+
                 initial_view_state=view_state,
                 tooltip=tooltip,
             )
@@ -699,40 +740,95 @@ with col12_right:
     new_bus_count = st.slider("신설 버스 대수", 0, 20, 2, 1)
     bus_capacity = st.number_input("버스 1대 수용 인원(명)", min_value=30, max_value=120, value=70, step=5)
 
-# -------------------------------------------------------------
-# 🚦 3사분면 · 혼잡도 예측
-# -------------------------------------------------------------
+
+
+        # 그래프 렌더 생략
+    # else: 이미 CSV가 있으므로 그대로 사용
+
+# 3–4사분면 레이아웃 컬럼
 col3, col4 = st.columns([1.6, 1.4], gap="large")
 
+
+# === 3사분면: 혼잡도 그래프 ===
+
+# 3사분면 섹션 시작 전에 CSV 보장
+with st.spinner("교통 기준년도 데이터 준비 중..."):
+    if TRAFFIC_XLSX_PATH.exists():
+        ensure_speed_csv(TRAFFIC_XLSX_PATH, TRAFFIC_CSV_PATH)  # ✅ 이름 수정
+    elif not TRAFFIC_CSV_PATH.exists():
+        st.warning(f"기준 CSV가 없습니다: {TRAFFIC_CSV_PATH.name}\n"
+                   f"→ data 폴더에 {TRAFFIC_XLSX_PATH.name} 를 넣으면 자동 변환됩니다.")
+
+
+
+# ===
+sel_lat = float(current.get("lat", 37.5667))
+sel_lon = float(current.get("lon", 126.9784))
+
 with col3:
-    st.markdown("### 🚦 3사분면 · 혼잡도 증가 예측")
+    st.markdown("### 🚦 3사분면 · 주변 도로 혼잡도 (기준년도)")
 
-    baseline_congestion = float(np.random.uniform(45, 65))
-    people_per_household = 2.3
-    delta_households = max(0, desired_households - int(current["households"]))
-    added_population = delta_households * people_per_household * (1 + expected_pop_increase_ratio / 100)
-    alpha, beta = 0.004, 0.0006
-    congestion_delta = alpha * added_population - beta * (new_bus_count * bus_capacity)
-    predicted_congestion = max(0.0, min(100.0, baseline_congestion + congestion_delta))
 
-    hours = np.arange(6, 23)
-    base_curve = np.clip(np.sin((hours-7)/4) * 20 + baseline_congestion, 10, 95)
-    after_curve = np.clip(base_curve + congestion_delta, 0, 100)
-    chart_df = pd.DataFrame({"hour": hours, "Baseline": base_curve, "After": after_curve})
-    chart_long = chart_df.melt("hour", var_name="Scenario", value_name="CongestionIndex")
+    radius = st.slider("반경(m)", 500, 3000, 1000, step=250, key="radius_m")
+    max_links = st.slider("표시 링크 수", 5, 20, 10, step=1, key="max_links")
 
-    line = (
-        alt.Chart(chart_long)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("hour:O", title="시간대"),
-            y=alt.Y("CongestionIndex:Q", title="혼잡도 지수(0~100)"),
-            color=alt.Color("Scenario:N", legend=alt.Legend(title="시나리오")),
-            tooltip=["hour", "Scenario", alt.Tooltip("CongestionIndex", format=".1f")],
-        )
-        .properties(height=360)
-    )
-    st.altair_chart(line, use_container_width=True)
+    if TRAFFIC_CSV_PATH.exists() and SHP_PATH.exists():
+        if _HAS_PLOT_SPEED:
+            chart_or_fig, df_plot = plot_speed(
+                csv_path=TRAFFIC_CSV_PATH,
+                shp_path=SHP_PATH,
+                center_lon=sel_lon,
+                center_lat=sel_lat,
+                radius_m=radius,
+                max_links=max_links,
+                renderer="altair",  # Altair 렌더러 사용
+                chart_height=700,  # ← 여기서 세로 길이 조절
+            )
+
+            # Altair Chart이면 st.altair_chart()로 표시
+            if isinstance(chart_or_fig, alt.Chart):
+                # Streamlit 테마가 Altair config를 덮어쓰지 않게
+                st.altair_chart(chart_or_fig, use_container_width=True, theme=None)
+            else:
+                st.pyplot(chart_or_fig, use_container_width=True)
+
+        else:
+            # utils에 plot_speed가 없거나 로딩 실패 시, 기존 함수로 안전하게 표시
+            fig, df_plot = plot_nearby_speed_from_csv(
+                csv_path=TRAFFIC_CSV_PATH,
+                shp_path=SHP_PATH,
+                center_lon=sel_lon,
+                center_lat=sel_lat,
+                radius_m=radius,
+                max_links=max_links,
+            )
+            st.pyplot(fig, use_container_width=True)
+
+        with st.expander("데이터 미리보기"):
+            st.dataframe(
+                df_plot.sort_values(["its_link_id", "hour"]).head(300),
+                use_container_width=True
+            )
+    else:
+        st.info("교통 CSV 또는 SHP가 없어 그래프를 생략합니다.")
+
+
+# === (간단 예측) 혼잡도 지수 산출: 4사분면 KPI용 ===
+baseline_congestion = float(np.random.uniform(45, 65))
+people_per_household = 2.3
+
+delta_households = max(
+    0,
+    (desired_households - int(current["households"])) if pd.notna(current["households"]) else desired_households
+)
+added_population = delta_households * people_per_household * (1 + expected_pop_increase_ratio / 100)
+
+alpha, beta = 0.004, 0.0006
+congestion_delta = alpha * added_population - beta * (new_bus_count * bus_capacity)
+predicted_congestion = max(0.0, min(100.0, baseline_congestion + congestion_delta))
+
+
+
 
 # -------------------------------------------------------------
 # 💹 4사분면 · 기대효과
