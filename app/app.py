@@ -667,7 +667,7 @@ with col12_right:
             f"- 주소: **{current['address_display']}**\n\n"
             f"- 추진위원회/조합명: **{current['org_name']}**\n\n"
             f"- 자치구: **{current['gu']}**\n\n"
-            f"- 기존 세대수: **{int(current['households']) if pd.notna(current['households']) else '미상'} 세대**\n\n"
+            f"- 계획 세대수: **{int(current['households']) if pd.notna(current['households']) else '미상'} 세대**\n\n"
             f"- 정비구역면적: **{int(current['land_area_m2']):,} m²**"
         )
 
