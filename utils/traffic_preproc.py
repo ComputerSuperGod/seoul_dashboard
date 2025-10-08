@@ -29,7 +29,8 @@ def _detect_layout(df0, max_scan_rows=15):
     return base_header_row, time_row, time_start_col, data_start_row
 
 
-def convert_average_speed_excel_to_csv(xlsx_path: Path, out_csv_path: Path) -> pd.DataFrame:
+def convert_average_speed_excel_to_csv(xlsx_path: Path, out_csv_path: Path,
+                                       prefer_id: str = "5.5"):  # "its" | "5.5"
     """
     AverageSpeed(LINK).xlsx → 정규화 CSV 저장.
     출력 컬럼: [its_link_id, 시간대, 평균속도(km/h), hour]
@@ -51,21 +52,33 @@ def convert_average_speed_excel_to_csv(xlsx_path: Path, out_csv_path: Path) -> p
     data.columns = [str(c).strip() for c in headers]
     data = data.dropna(how="all")
 
-    # 링크 컬럼 찾기 (ITS LINK ID 우선)
+    # 링크 컬럼 찾기 (우선순위 적용)
     link_col = None
-    for c in data.columns[:time_c0]:
-        cu = str(c).upper()
-        if ("ITS" in cu and "LINK" in cu) or cu in {"LINK_ID", "LINKID"}:
-            link_col = c
-            break
-    if link_col is None:
+    cand_en = [c for c in data.columns[:time_c0]]
+
+    def pick(colnames, keywords):
+        for c in colnames:
+            cu = str(c).upper()
+            if all(k in cu for k in keywords):
+                return c
+        return None
+
+    if prefer_id == "5.5":
+        # 예시 키워드: "5.5", "LINK"
+        link_col = pick(cand_en, ["5.5", "LINK"]) or pick(cand_en, ["LINK_ID"]) or pick(cand_en, ["LINKID"])
         # 한글 백업
+        if link_col is None:
+            link_col = next((c for c in data.columns[:time_c0] if "5.5" in str(c) and "링크" in str(c)), None)
+    else:  # ITS 우선
+        link_col = pick(cand_en, ["ITS", "LINK"]) or pick(cand_en, ["LINK_ID"]) or pick(cand_en, ["LINKID"])
+
+    if link_col is None:
+        # 최후: 기존 휴리스틱
         for c in data.columns[:time_c0]:
             if "링크" in str(c):
                 link_col = c
                 break
     if link_col is None:
-        # 최후: 첫번째 식별자 성격 컬럼
         link_col = data.columns[0]
 
     # 시간대 컬럼
@@ -86,12 +99,9 @@ def convert_average_speed_excel_to_csv(xlsx_path: Path, out_csv_path: Path) -> p
                 return None
         return None
 
-    df_long["hour"] = df_long["시간대"].map(to_hour_bucket)
-    df_long = df_long.dropna(subset=["hour"])
-    df_long["hour"] = df_long["hour"].astype(int)
-    df_long = df_long.rename(columns={link_col: "its_link_id"})
-
-    # 저장
+    df_long["hour"] = df_long["시간대"].map(to_hour_bucket).dropna().astype(int)
+    # ✅ 공통 컬럼명으로 통일
+    df_long = df_long.rename(columns={link_col: "link_id"})  # <— 표준화된 키 이름
     df_long.to_csv(out_csv_path, index=False)
     return df_long
 

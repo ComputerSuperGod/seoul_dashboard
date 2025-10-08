@@ -45,8 +45,8 @@ PROJECTS_CSV_PATH = DATA_DIR / "seoul_redev_projects.csv"
 TRAFFIC_XLSX_PATH = DATA_DIR / "AverageSpeed(LINK).xlsx"
 TRAFFIC_CSV_PATH  = DATA_DIR / f"AverageSpeed_Seoul_{BASE_YEAR}.csv"
 
-# 도로망 레벨6 쉐이프
-SHP_PATH = DATA_DIR / "seoul_link_lev6_2023.shp"
+# 도로망 레벨55 쉐이프
+SHP_PATH = DATA_DIR / "seoul_link_lev5.5_2023.shp"
 
 
 
@@ -781,8 +781,8 @@ with col3:
                 center_lat=sel_lat,
                 radius_m=radius,
                 max_links=max_links,
-                renderer="altair",  # Altair 렌더러 사용
-                chart_height=700,  # ← 여기서 세로 길이 조절
+                renderer="altair",
+                chart_height=700,
             )
 
             # Altair Chart이면 st.altair_chart()로 표시
@@ -806,7 +806,7 @@ with col3:
 
         with st.expander("데이터 미리보기"):
             st.dataframe(
-                df_plot.sort_values(["its_link_id", "hour"]).head(300),
+                df_plot.sort_values(["link_id", "hour"]).head(300),
                 use_container_width=True
             )
     else:
