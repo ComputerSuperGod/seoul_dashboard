@@ -94,6 +94,115 @@ CSV_ENCODING = "cp949"
 COORD_CSV_PATH = BASE_DIR / "data" / "서울시_재개발재건축_clean_kakao.csv"
 COORD_ENCODING = "utf-8-sig"  # (스마트 로더가 자동판별하므로 없어도 동작)
 
+# 1) CSV 로드 유틸 (교통량 CSV)
+@st.cache_data(show_spinner=False)
+def load_volume_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["link_id"] = df["link_id"].astype(str)
+
+    # 시간 안전 정규화: "0시", " 08 ", "8.0" 등도 0~23으로 변환
+    h = pd.to_numeric(
+        pd.Series(df["hour"]).astype(str).str.extract(r"(\d+)", expand=False),
+        errors="coerce"
+    ).fillna(0).astype(int) % 24
+    df["hour"] = h
+
+    df["차량대수"] = pd.to_numeric(df["차량대수"], errors="coerce").fillna(0)
+    return df
+
+
+# 2) 교통량 가중 혼잡빈도강도(CFI) 계산
+def compute_cfi_weighted(speed_df: pd.DataFrame, vol_df: pd.DataFrame, boundary_speed: float = 30.0):
+    d = speed_df.copy()
+    d["link_id"] = d["link_id"].astype(str)
+    d["hour"] = d["hour"].astype(int)
+    d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
+
+    # merge
+    m = d.merge(vol_df, on=["link_id", "hour"], how="inner")
+
+    # 혼잡 차량수(속도<=경계값) vs 전체 차량수
+    m["혼잡차량수"] = (m["평균속도(km/h)"] <= boundary_speed).astype(int) * m["차량대수"]
+    g = m.groupby(["link_id", "hour"], as_index=False).agg(
+        전체차량수=("차량대수", "sum"),
+        혼잡차량수=("혼잡차량수", "sum"),
+    )
+    g["혼잡빈도강도(%)"] = (g["혼잡차량수"] / g["전체차량수"]).replace([float("inf"), float("nan")], 0) * 100
+    return g
+
+def compute_cfi_soft(
+    speed_df: pd.DataFrame,
+    vol_df: pd.DataFrame,
+    boundary_mode: str = "percentile",  # "percentile" or "fixed"
+    boundary_value: float = 40.0,       # percentile: 10~90(%), fixed: km/h
+    tau_kmh: float = 6.0                # 시그모이드 급경사 폭(값이 크면 더 부드러움)
+):
+    """
+    평균속도(시간대별 1개) + 시간대 총 차량대수만 있을 때
+    시그모이드 기반의 '부드러운' 혼잡 확률을 만들어 교통량 가중 CFI 근사.
+
+    p_cong(V) = 1 / (1 + exp((V - vb) / tau)),  vb는 경계속도
+    혼잡빈도강도(%) = 100 * ( sum(volume * p_cong) / sum(volume) )
+
+    - hour 정규화: 0~23
+    - 속도/교통량 숫자형 강제 변환
+    """
+    # --- 속도 데이터 정리 ---
+    d = speed_df.copy()
+    d["link_id"] = d["link_id"].astype(str)
+    d["hour"] = pd.to_numeric(d["hour"], errors="coerce").astype("Int64")  # allow NA
+    d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
+
+    # --- 교통량 데이터 정리 ---
+    v = vol_df.copy()
+    v["link_id"] = v["link_id"].astype(str)
+    # "0시" 같은 문자열이 와도 안전하게 0~23으로 정규화
+    v["hour"] = pd.to_numeric(v["hour"], errors="coerce").astype("Int64") % 24
+    v["차량대수"] = pd.to_numeric(v["차량대수"], errors="coerce").fillna(0)
+
+    # --- 병합 ---
+    m = d.merge(v, on=["link_id", "hour"], how="inner").dropna(subset=["평균속도(km/h)"])
+    if m.empty:
+        out = m[["link_id","hour"]].copy()
+        out["혼잡빈도강도(%)"] = 0.0
+        out.attrs = {"boundary": np.nan, "mode": boundary_mode}
+        return out
+
+    # --- 경계속도 결정 ---
+    if boundary_mode == "percentile":
+        p = float(boundary_value)
+        p = max(5.0, min(95.0, p))  # 안전 범위
+        vb = float(np.nanpercentile(m["평균속도(km/h)"], p))
+    else:
+        vb = float(boundary_value)
+
+    # --- 시그모이드 혼잡확률 ---
+    tau = max(1e-6, float(tau_kmh))
+    # V > vb이면 0쪽, V < vb이면 1쪽으로 연속적으로 변함
+    m["p_cong"] = 1.0 / (1.0 + np.exp((m["평균속도(km/h)"] - vb) / tau))
+
+    # --- 링크×시간대로 집계 (교통량 가중 평균) ---
+    # 가중평균: sum(w*x)/sum(w)
+    def _wavg(x, w):
+        w = np.asarray(w)
+        x = np.asarray(x)
+        mask = np.isfinite(x) & np.isfinite(w) & (w >= 0)
+        if not mask.any():
+            return 0.0
+        return float((x[mask] * w[mask]).sum() / max(1e-9, w[mask].sum()))
+
+    g = (
+        m.groupby(["link_id","hour"], as_index=False)
+         .apply(lambda df: pd.Series({
+             "혼잡빈도강도(%)": _wavg(df["p_cong"], df["차량대수"]) * 100.0
+         }))
+         .reset_index()
+    )
+
+    # 안전 클립
+    g["혼잡빈도강도(%)"] = g["혼잡빈도강도(%)"].clip(0, 100)
+    g.attrs = {"boundary": vb, "mode": boundary_mode, "tau": tau}
+    return g
 
 
 
@@ -178,6 +287,22 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown("""
+<style>
+/* 모든 LaTeX 수식을 왼쪽 정렬로 */
+.katex-display {
+    text-align: left !important;
+    margin-left: 0 !important;
+}
+
+/* 텍스트 전체 기본 왼쪽 정렬 유지 */
+.block-container {
+    text-align: left !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 STYLE = """
 <style>
 .small-muted { color: #7a7a7a; font-size: 0.9rem; }
@@ -189,6 +314,28 @@ hr.soft { border: none; height: 1px; background: #1f2937; margin: 16px 0; }
 </style>
 """
 st.markdown(STYLE, unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Streamlit의 기본 center 정렬을 강제로 무력화 — 더 강한 선택자 사용 */
+div[data-testid="stMarkdownContainer"] .katex-display {
+    text-align: left !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+}
+
+/* KaTeX 내부 박스를 줄 맞춰 붙게 */
+div[data-testid="stMarkdownContainer"] .katex-display > .katex {
+    display: inline-block !important;
+}
+
+/* 일반 문단도 혹시 모를 가운데정렬을 방지 */
+div[data-testid="stMarkdownContainer"] p {
+    text-align: left !important;
+    margin-left: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 # -------------------------------------------------------------
@@ -811,6 +958,196 @@ with col3:
             )
     else:
         st.info("교통 CSV 또는 SHP가 없어 그래프를 생략합니다.")
+
+# === 혼잡도 / 혼잡빈도강도 토글 그래프 ===
+if df_plot is not None and not df_plot.empty:
+    st.markdown("### 📈 혼잡지표 비교 (혼잡도 vs 혼잡빈도강도)")
+
+    # --- 혼잡도 계산 ---
+    def compute_congestion_from_speed(df_plot):
+        d = df_plot.copy()
+        # 🔹 속도 데이터를 숫자형으로 강제 변환
+        d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
+
+        # 🔹 자유주행속도 계산 후 혼잡도 계산
+        d["free_flow"] = d.groupby("link_id")["평균속도(km/h)"].transform("max").clip(lower=1)
+        d["혼잡도(%)"] = ((1 - (d["평균속도(km/h)"] / d["free_flow"]).clip(0, 1)) * 100).clip(0, 100)
+        d["지표명"] = "혼잡도"
+        return d[["link_id", "hour", "혼잡도(%)", "지표명"]]
+
+
+    # --- 혼잡빈도강도 계산 ---
+    def compute_congestion_freq_intensity(df_plot, boundary_speed=30):
+        d = df_plot.copy()
+        d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
+        d["혼잡빈도강도(%)"] = (d["평균속도(km/h)"] <= boundary_speed).astype(int) * 100
+        d = (
+            d.groupby(["link_id", "hour"], as_index=False)["혼잡빈도강도(%)"]
+            .mean()
+        )
+        d["지표명"] = "혼잡빈도강도"
+        return d
+
+
+    def compute_cfi_weighted_robust(
+            speed_df: pd.DataFrame,
+            vol_df: pd.DataFrame,
+            boundary_mode: str = "percentile",  # "fixed" or "percentile"
+            boundary_value: float = 30.0,  # fixed: km/h, percentile: 10~90
+            min_samples: int = 1  # 시간대별 최소 표본 차량수
+    ):
+        """
+        - hour 정렬 자동보정 (0~23 강제)
+        - 혼잡경계속도 동적 산정 지원:
+            * boundary_mode="fixed": boundary_value(km/h) 그대로 사용
+            * boundary_mode="percentile": speed 분포의 p-분위수(km/h) 사용
+        - 차량 표본이 너무 적은 시간대는 제외(또는 0 처리)
+        """
+        d = speed_df.copy()
+        d["link_id"] = d["link_id"].astype(str)
+        d["hour"] = pd.to_numeric(d["hour"], errors="coerce").astype("Int64")
+        d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
+
+        v = vol_df.copy()
+        v["link_id"] = v["link_id"].astype(str)
+        v["hour"] = pd.to_numeric(v["hour"], errors="coerce").astype("Int64") % 24
+        v["차량대수"] = pd.to_numeric(v["차량대수"], errors="coerce").fillna(0)
+
+        # 병합
+        m = d.merge(v, on=["link_id", "hour"], how="inner").dropna(subset=["평균속도(km/h)"])
+
+        # boundary 결정
+        if boundary_mode == "percentile":
+            import numpy as np
+            p = float(boundary_value)
+            p = max(5.0, min(95.0, p))
+            boundary = np.nanpercentile(m["평균속도(km/h)"], p)
+        else:
+            boundary = float(boundary_value)
+
+        m["혼잡차량수"] = (m["평균속도(km/h)"] <= boundary).astype(int) * m["차량대수"]
+
+        g = (m.groupby(["link_id", "hour"], as_index=False)
+             .agg(전체차량수=("차량대수", "sum"),
+                  혼잡차량수=("혼잡차량수", "sum")))
+
+        g.loc[g["전체차량수"] < max(1, min_samples), ["혼잡차량수", "전체차량수"]] = np.nan
+        g["혼잡빈도강도(%)"] = (g["혼잡차량수"] / g["전체차량수"]) * 100
+        g["혼잡빈도강도(%)"] = g["혼잡빈도강도(%)"].fillna(0).clip(0, 100)
+
+        g.attrs = {"boundary": boundary, "mode": boundary_mode}
+        return g
+
+
+    # --- 사용자 토글 ---
+    metric_choice = st.radio(
+        "표시할 혼잡지표 선택",
+        ["혼잡도", "혼잡빈도강도"],
+        horizontal=True,
+        index=0,
+        key="metric_toggle"
+    )
+
+    # ------------------------------
+    # 혼잡도 / 혼잡빈도강도 계산
+    # ------------------------------
+    if metric_choice == "혼잡도":
+        df_metric = compute_congestion_from_speed(df_plot).rename(columns={"혼잡도(%)": "value"})
+        y_title = "혼잡도 (0=자유주행, 100=매우혼잡)"
+    else:
+        # 교통량 파일이 있으면 '교통량 가중 Soft CFI', 없으면 단순 CFI
+        vol_path = DATA_DIR / "TrafficVolume_Seoul_2023.csv"
+        if vol_path.exists():
+            vol_norm = load_volume_csv(vol_path)
+
+            # 경계속도/밴드 UI
+            bcol1, bcol2, bcol3 = st.columns([1, 1, 1])
+            with bcol1:
+                boundary_mode = st.radio("경계방식", ["percentile", "fixed"], horizontal=True, index=0, key="bd_mode")
+            with bcol2:
+                if boundary_mode == "percentile":
+                    boundary_value = float(st.slider("속도분포 분위수(%)", 10, 90, 40, 5, key="bd_pct"))
+                else:
+                    boundary_value = float(st.number_input("고정 경계속도(km/h)", 10.0, 100.0, 30.0, 1.0, key="bd_fix"))
+            with bcol3:
+                band_kmh = float(st.slider("완화 밴드폭 (km/h)", 5, 20, 10, 1, key="bd_band"))
+
+            # 교통량 가중 Soft CFI
+            df_cfi = compute_cfi_soft(
+                df_plot, vol_norm,
+                boundary_mode=boundary_mode,
+                boundary_value=boundary_value,
+                tau_kmh=band_kmh
+            )
+
+            used_boundary = getattr(df_cfi, "attrs", {}).get("boundary", None)
+            if used_boundary is not None:
+                st.caption(f"사용된 경계속도 ≈ {used_boundary:.1f} km/h (밴드폭 {band_kmh:.1f} km/h)")
+
+            df_metric = df_cfi.rename(columns={"혼잡빈도강도(%)": "value"})
+            y_title = "혼잡빈도강도 (교통량 가중 · Soft)"
+        else:
+            # 볼륨 파일 없을 때의 단순 CFI
+            df_metric = compute_congestion_freq_intensity(df_plot).rename(columns={"혼잡빈도강도(%)": "value"})
+            y_title = "혼잡빈도강도 (혼잡구간 차량비율)"
+
+    # ------------------------------
+    # ✅ 차트 그리기
+    # ------------------------------
+    # 평균속도 그래프와 비슷한 높이
+    CHART_H = 400  # average speed에서 chart_height=700 이라면 동일 적용
+    HALF_W = 1100  # 가로 절반 느낌의 고정폭(원하면 500~700에서 조정)
+
+    chart = (
+        alt.Chart(df_metric)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("hour:Q", title="시간대 (시)"),
+            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color(
+                "link_id:N",
+                title="링크 ID",
+                legend=alt.Legend(
+                    orient="bottom",  # ✅ 범주를 아래쪽에 배치
+                    direction="horizontal",  # 가로로 나열
+                    columns=4  # 한 줄에 4개씩 (원하면 3~6으로 조정 가능)
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("link_id:N", title="링크"),
+                alt.Tooltip("hour:Q", title="시"),
+                alt.Tooltip("value:Q", title=y_title, format=".1f"),
+            ],
+        )
+        .properties(
+            title=f"{metric_choice} 변화 추이",
+            width=HALF_W,  # ⬅️ 가로폭 고정
+            height=CHART_H  # ⬅️ 세로높이 고정(평균속도와 맞춤)
+        )
+        .configure_view(strokeWidth=0)
+    )
+
+    # width/height를 적용하려면 use_container_width=False 로!
+    st.altair_chart(chart, use_container_width=False, theme=None)
+
+    # ------------------------------
+    # ✅ 그래프 아래 수식/설명
+    # ------------------------------
+    if metric_choice == "혼잡도":
+        st.markdown("### 🧮 혼잡도(%) 정의")
+        st.markdown("- 링크 $(l)$, 시간대 $(h)$에서의 평균속도를 $v_{l,h}$ 라 할 때,")
+        st.latex(r"v_{\mathrm{ff},l}=\max v_{l,h}")
+        st.latex(r"\mathrm{혼잡도}_{l,h}(\%)=\Big(1-\min\big(1,\frac{v_{l,h}}{v_{\mathrm{ff},l}}\big)\Big)\times 100")
+        st.markdown("- 값의 의미: **0% = 자유주행**, **100% = 매우 혼잡**")
+    else:
+        st.markdown("### 🧮 혼잡빈도강도(%) 정의 (교통량 가중 · Soft)")
+        st.markdown("- 경계속도 $v_b$ 부근에서 부드럽게 전환되는 시그모이드 확률로 혼잡 여부를 근사합니다.")
+        st.latex(r"p_{\mathrm{cong}}(v)=\frac{1}{1+\exp\!\left(\frac{v-v_b}{\tau}\right)}")
+        st.markdown("- 링크·시간대별 혼잡빈도강도는 **교통량 가중 평균**으로 계산합니다.")
+        st.latex(r"""\mathrm{CFI}_{l,h}(\%)=100\times
+        \frac{\sum_i w_{l,h,i}\,p_{\mathrm{cong}}(v_{l,h,i})}{\sum_i w_{l,h,i}}""")
+        st.markdown("- 여기서 $w$는 차량대수, $\\tau$는 전환의 부드러움을 제어하는 밴드폭(km/h)입니다.")
+
 
 
 # === (간단 예측) 혼잡도 지수 산출: 4사분면 KPI용 ===
