@@ -115,7 +115,7 @@
 pip install -r requirements.txt
 
 # Streamlit 실행
-streamlit run app.py
+streamlit run app/app.py
 ```
 
 ---
