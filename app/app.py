@@ -1,33 +1,28 @@
 # -------------------------------------------------------------
 # 🏗 AIoT 스마트 인프라 대시보드 (재건축 의사결정 Helper)
 # -------------------------------------------------------------
-# 📊 CSV 기반 데이터 반영 버전
+# 📊 CSV 기반 데이터 반영 버전 — 정리/개선본
 # -------------------------------------------------------------
 
 # --- must come first: add project root to sys.path BEFORE importing utils ---
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # .../seoul_dashboard_3
+BASE_DIR = Path(__file__).resolve().parent.parent  # .../seoul_dashboard
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 # ---------------------------------------------------------------------------
 
 import streamlit as st
-import numpy_financial as npf
 import pandas as pd
 import numpy as np
 import pydeck as pdk
 import altair as alt
 import geopandas as gpd
+from datetime import datetime
 
 from components.sidebar_presets import render_sidebar_presets
 from components.sidebar_4quadrant_guide import render_sidebar_4quadrant_guide
-import streamlit as st
-
-
-
-from datetime import datetime
 
 # === [SESSION KEYS INIT] ===
 if "matched_links_geojson" not in st.session_state:
@@ -38,14 +33,24 @@ if "matched_links_geojson_daily" not in st.session_state:
 # === 외부 모듈 (utils) 임포트 ===
 from utils.traffic_preproc import ensure_speed_csv
 
-# Altair/MPL/Plotly 스위치형: plot_speed가 없거나 로딩 실패하면 기존 함수로 폴백
+# Altair/MPL/Plotly 스위치형: plot_speed가 없거나 모듈 자체가 없으면 안전 폴백
+_HAS_PLOT_SPEED = None
+_plot_speed = None
+_plot_nearby = None
 try:
-    from utils.traffic_plot import plot_speed
-    _HAS_PLOT_SPEED = True
-except Exception as e:
-    print("utils.traffic_plot import fallback:", e)
-    from utils.traffic_plot import plot_nearby_speed_from_csv
-    _HAS_PLOT_SPEED = False
+    # 모듈이 존재하는지 먼저 확인
+    import utils.traffic_plot as _tpl
+    try:
+        from utils.traffic_plot import plot_speed as _plot_speed  # altair 우선
+        _HAS_PLOT_SPEED = True
+    except Exception as e:
+        try:
+            from utils.traffic_plot import plot_nearby_speed_from_csv as _plot_nearby
+            _HAS_PLOT_SPEED = False
+        except Exception:
+            _HAS_PLOT_SPEED = None
+except Exception:
+    _HAS_PLOT_SPEED = None
 
 # === 데이터 디렉터리 ===
 DATA_DIR = BASE_DIR / "data"
@@ -75,7 +80,6 @@ with st.sidebar:
 
 # 🔤 안전한 CSV 로더: 여러 인코딩 시도
 def smart_read_csv(path, encodings=("utf-8-sig", "cp949", "euc-kr", "utf-8", "latin1")):
-    import pandas as pd
     last_err = None
     for enc in encodings:
         try:
@@ -92,16 +96,9 @@ def smart_read_csv(path, encodings=("utf-8-sig", "cp949", "euc-kr", "utf-8", "la
         raise last_err or Exception(f"Failed to read {path} with tried encodings.")
 
 # -------------------------------------------------------------
-# ✅ 프로젝트 루트 기준 경로 자동 설정
-# -------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent
-CSV_PATH = BASE_DIR / "data" / "seoul_redev_projects.csv"
-CSV_ENCODING = "cp949"
-
-# -------------------------------------------------------------
 # 📦 좌표 CSV 병합 유틸
 # -------------------------------------------------------------
-COORD_CSV_PATH = BASE_DIR / "data" / "서울시_재개발재건축_clean_kakao.csv"
+COORD_CSV_PATH = DATA_DIR / "서울시_재개발재건축_clean_kakao.csv"
 COORD_ENCODING = "utf-8-sig"  # (스마트 로더가 자동판별하므로 없어도 동작)
 
 # 1) CSV 로드 유틸 (교통량 CSV)
@@ -120,7 +117,7 @@ def load_volume_csv(path: Path) -> pd.DataFrame:
     df["차량대수"] = pd.to_numeric(df["차량대수"], errors="coerce").fillna(0)
     return df
 
-# 2) 교통량 가중 혼잡빈도강도(CFI) 계산
+# 2) 교통량 가중 혼잡빈도강도(CFI) 계산 (Hard threshold)
 def compute_cfi_weighted(speed_df: pd.DataFrame, vol_df: pd.DataFrame, boundary_speed: float = 30.0):
     d = speed_df.copy()
     d["link_id"] = d["link_id"].astype(str)
@@ -139,6 +136,7 @@ def compute_cfi_weighted(speed_df: pd.DataFrame, vol_df: pd.DataFrame, boundary_
     g["혼잡빈도강도(%)"] = (g["혼잡차량수"] / g["전체차량수"]).replace([float("inf"), float("nan")], 0) * 100
     return g
 
+# 3) Soft(시그모이드) CFI
 def compute_cfi_soft(
     speed_df: pd.DataFrame,
     vol_df: pd.DataFrame,
@@ -146,23 +144,16 @@ def compute_cfi_soft(
     boundary_value: float = 40.0,       # percentile: 10~90(%), fixed: km/h
     tau_kmh: float = 6.0                # 시그모이드 급경사 폭(값이 크면 더 부드러움)
 ):
-    """
-    평균속도(시간대별 1개) + 시간대 총 차량대수만 있을 때
-    시그모이드 기반의 '부드러운' 혼잡 확률을 만들어 교통량 가중 CFI 근사.
-    """
-    # --- 속도 데이터 정리 ---
     d = speed_df.copy()
     d["link_id"] = d["link_id"].astype(str)
     d["hour"] = pd.to_numeric(d["hour"], errors="coerce").astype("Int64")  # allow NA
     d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
 
-    # --- 교통량 데이터 정리 ---
     v = vol_df.copy()
     v["link_id"] = v["link_id"].astype(str)
     v["hour"] = pd.to_numeric(v["hour"], errors="coerce").astype("Int64") % 24
     v["차량대수"] = pd.to_numeric(v["차량대수"], errors="coerce").fillna(0)
 
-    # --- 병합 ---
     m = d.merge(v, on=["link_id", "hour"], how="inner").dropna(subset=["평균속도(km/h)"])
     if m.empty:
         out = m[["link_id","hour"]].copy()
@@ -170,7 +161,6 @@ def compute_cfi_soft(
         out.attrs = {"boundary": np.nan, "mode": boundary_mode}
         return out
 
-    # --- 경계속도 결정 ---
     if boundary_mode == "percentile":
         p = float(boundary_value)
         p = max(5.0, min(95.0, p))  # 안전 범위
@@ -178,11 +168,9 @@ def compute_cfi_soft(
     else:
         vb = float(boundary_value)
 
-    # --- 시그모이드 혼잡확률 ---
     tau = max(1e-6, float(tau_kmh))
     m["p_cong"] = 1.0 / (1.0 + np.exp((m["평균속도(km/h)"] - vb) / tau))
 
-    # --- 링크×시간대로 집계 (교통량 가중 평균) ---
     def _wavg(x, w):
         w = np.asarray(w)
         x = np.asarray(x)
@@ -199,7 +187,6 @@ def compute_cfi_soft(
          .reset_index()
     )
 
-    # 안전 클립
     g["혼잡빈도강도(%)"] = g["혼잡빈도강도(%)"].clip(0, 100)
     g.attrs = {"boundary": vb, "mode": boundary_mode, "tau": tau}
     return g
@@ -213,18 +200,18 @@ def load_coords() -> pd.DataFrame:
     df["lon"] = pd.to_numeric(df.get("lon"), errors="coerce")
 
     # 안전한 병합용 기초 컬럼 생성
-    def coalesce(a, b):
+    def _coal(a, b):
         a = "" if a is None else str(a).strip()
         b = "" if b is None else str(b).strip()
         return a if a else b
 
     # name, address 만들기
     if ("정비구역명칭" in df.columns) or ("추진위원회/조합명" in df.columns):
-        name = [coalesce(n, m) for n, m in zip(df.get("정비구역명칭"), df.get("추진위원회/조합명"))]
+        name = [_coal(n, m) for n, m in zip(df.get("정비구역명칭"), df.get("추진위원회/조합명"))]
     else:
         name = df.get("name")
 
-    address = [coalesce(a, b) for a, b in zip(df.get("정비구역위치"), df.get("대표지번"))]
+    address = [_coal(a, b) for a, b in zip(df.get("정비구역위치"), df.get("대표지번"))]
 
     out = pd.DataFrame({
         "apt_id": df.get("사업번호").astype(str) if "사업번호" in df.columns else "",
@@ -286,15 +273,9 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* 모든 LaTeX 수식을 왼쪽 정렬로 */
-.katex-display {
-    text-align: left !important;
-    margin-left: 0 !important;
-}
-
+.katex-display { text-align: left !important; margin-left: 0 !important; }
 /* 텍스트 전체 기본 왼쪽 정렬 유지 */
-.block-container {
-    text-align: left !important;
-}
+.block-container { text-align: left !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -312,18 +293,9 @@ st.markdown(STYLE, unsafe_allow_html=True)
 
 st.markdown("""
 <style>
-div[data-testid="stMarkdownContainer"] .katex-display {
-    text-align: left !important;
-    margin-left: 0 !important;
-    margin-right: auto !important;
-}
-div[data-testid="stMarkdownContainer"] .katex-display > .katex {
-    display: inline-block !important;
-}
-div[data-testid="stMarkdownContainer"] p {
-    text-align: left !important;
-    margin-left: 0 !important;
-}
+div[data-testid="stMarkdownContainer"] .katex-display { text-align: left !important; margin-left: 0 !important; margin-right: auto !important; }
+div[data-testid="stMarkdownContainer"] .katex-display > .katex { display: inline-block !important; }
+div[data-testid="stMarkdownContainer"] p { text-align: left !important; margin-left: 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -499,7 +471,7 @@ with st.expander("🔍 데이터 소스 확인(임시)", expanded=False):
     raw = load_raw_csv()
     cols_raw = ["자치구", "정비구역명칭", "추진위원회/조합명", "분양세대총수", "정비구역면적(㎡)"]
     exist_cols = [c for c in cols_raw if c in raw.columns]
-    st.caption(f"원본: {CSV_PATH.name} · 표시열: {', '.join(exist_cols)}")
+    st.caption(f"원본: {PROJECTS_CSV_PATH.name} · 표시열: {', '.join(exist_cols)}")
     try:
         st.dataframe(
             raw[exist_cols][raw["자치구"] == selected_gu].head(20),
@@ -514,7 +486,7 @@ with st.expander("🔍 데이터 소스 확인(임시)", expanded=False):
         use_container_width=True
     )
 
-    def _coalesce(a, b):
+    def _coal2(a, b):
         a = "" if a is None else str(a).strip()
         b = "" if b is None else str(b).strip()
         return a if a else b
@@ -522,7 +494,7 @@ with st.expander("🔍 데이터 소스 확인(임시)", expanded=False):
     raw_norm = pd.DataFrame({
         "gu": raw.get("자치구"),
         "name_raw": [
-            _coalesce(n, m) for n, m in zip(
+            _coal2(n, m) for n, m in zip(
                 raw.get("정비구역명칭"),
                 raw.get("추진위원회/조합명")
             )
@@ -730,17 +702,14 @@ if st.session_state.selected_row is None:
     st.stop()
 selected_row = st.session_state.selected_row
 
-
 # ✅ 4사분면 연동용 세션 설정
 selected_site_name = df_map.loc[selected_row, "name"]
 st.session_state["selected_site"] = selected_site_name
-
 
 # ✅ 지도 데이터/레이어 만들기 (selected_row 확정 이후)
 filtered_indices = edited["orig_index"].tolist()
 map_data = df_map.loc[filtered_indices].reset_index(drop=True)
 
-# ⬇︎ 추가
 def _point_tooltip(row):
     addr = row.get("address_display", "")
     gu = row.get("gu", "")
@@ -758,7 +727,6 @@ highlight_row = df_map.loc[[selected_row]].assign(_selected=True)
 highlight_row = highlight_row.copy()
 highlight_row["tooltip_html"] = highlight_row.apply(_point_tooltip, axis=1)
 
-
 sel_lat = float(df_map.loc[selected_row, "lat"])
 sel_lon = float(df_map.loc[selected_row, "lon"])
 view_state = pdk.ViewState(latitude=sel_lat, longitude=sel_lon, zoom=12.5)
@@ -774,7 +742,6 @@ layer_points = pdk.Layer(
     line_width_min_pixels=0.5,
 )
 
-highlight_row = df_map.loc[[selected_row]].assign(_selected=True)
 layer_highlight = pdk.Layer(
     "ScatterplotLayer",
     data=highlight_row,
@@ -790,7 +757,6 @@ tooltip = {
     "html": "{tooltip_html}",
     "style": {"backgroundColor": "#0f172a", "color": "white"},
 }
-
 
 with col12_right:
     st.markdown("### 🧾 [1사분면] · 기존 단지 정보")
@@ -835,8 +801,8 @@ with col3:
 
     df_plot = None
     if TRAFFIC_CSV_PATH.exists() and SHP_PATH.exists():
-        if _HAS_PLOT_SPEED:
-            chart_or_fig, df_plot = plot_speed(
+        if _HAS_PLOT_SPEED is True and _plot_speed is not None:
+            chart_or_fig, df_plot = _plot_speed(
                 csv_path=TRAFFIC_CSV_PATH,
                 shp_path=SHP_PATH,
                 center_lon=sel_lon,
@@ -846,15 +812,12 @@ with col3:
                 renderer="altair",
                 chart_height=700,
             )
-            # 🔸 지도 즉시 렌더하던 PathLayer/combined_layers 호출은 삭제(렌더 금지)
-
-            # Altair Chart이면 st.altair_chart()로 표시
             if isinstance(chart_or_fig, alt.Chart):
                 st.altair_chart(chart_or_fig, use_container_width=True, theme=None)
             else:
                 st.pyplot(chart_or_fig, use_container_width=True)
-        else:
-            fig, df_plot = plot_nearby_speed_from_csv(
+        elif _HAS_PLOT_SPEED is False and _plot_nearby is not None:
+            fig, df_plot = _plot_nearby(
                 csv_path=TRAFFIC_CSV_PATH,
                 shp_path=SHP_PATH,
                 center_lon=sel_lon,
@@ -863,39 +826,41 @@ with col3:
                 max_links=max_links,
             )
             st.pyplot(fig, use_container_width=True)
-
-        if df_plot is not None:
-            with st.expander("데이터 미리보기"):
-                st.dataframe(
-                    df_plot.sort_values(["link_id", "hour"]).head(300),
-                    use_container_width=True
-                )
-
-        # === 3사분면: 시간대 기준 결과 → SHP 매칭 → GeoJSON(시간대) 저장 ===
-        try:
-            if df_plot is not None and not df_plot.empty:
-                shp = gpd.read_file(SHP_PATH)[[LINK_ID_COL, "geometry"]]
-                if shp.crs is None or (shp.crs.to_epsg() != 4326):
-                    shp = shp.to_crs(epsg=4326)
-
-                shp["link_id_norm"] = (
-                    pd.to_numeric(shp[LINK_ID_COL], errors="coerce").round().astype("Int64").astype(str)
-                )
-                ids = (
-                    df_plot["link_id"].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()
-                )
-                link_gdf = shp[shp["link_id_norm"].isin(ids)].copy()
-
-                st.session_state["matched_links_geojson"] = link_gdf.__geo_interface__
-            else:
-                st.session_state["matched_links_geojson"] = None
-        except Exception as e:
-            st.session_state["matched_links_geojson"] = None
-            st.info(f"링크 매칭 중 오류: {e}")
+        else:
+            st.info("`utils/traffic_plot.py` 모듈을 찾을 수 없어 간략 모드로 표시합니다. (시각화 생략)")
     else:
         st.info("교통 CSV 또는 SHP가 없어 그래프를 생략합니다.")
 
-                # === 혼잡도 / 혼잡빈도강도 토글 그래프 ===
+    if df_plot is not None:
+        with st.expander("데이터 미리보기"):
+            st.dataframe(
+                df_plot.sort_values(["link_id", "hour"]).head(300),
+                use_container_width=True
+            )
+
+    # === 3사분면: 시간대 기준 결과 → SHP 매칭 → GeoJSON(시간대) 저장 ===
+    try:
+        if df_plot is not None and not df_plot.empty:
+            shp = gpd.read_file(SHP_PATH)[[LINK_ID_COL, "geometry"]]
+            if shp.crs is None or (shp.crs.to_epsg() != 4326):
+                shp = shp.to_crs(epsg=4326)
+
+            shp["link_id_norm"] = (
+                pd.to_numeric(shp[LINK_ID_COL], errors="coerce").round().astype("Int64").astype(str)
+            )
+            ids = (
+                df_plot["link_id"].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()
+            )
+            link_gdf = shp[shp["link_id_norm"].isin(ids)].copy()
+
+            st.session_state["matched_links_geojson"] = link_gdf.__geo_interface__
+        else:
+            st.session_state["matched_links_geojson"] = None
+    except Exception as e:
+        st.session_state["matched_links_geojson"] = None
+        st.info(f"링크 매칭 중 오류: {e}")
+
+    # === 혼잡도 / 혼잡빈도강도 토글 그래프 ===
     if 'df_plot' in locals() and df_plot is not None and not df_plot.empty:
         st.markdown("### 📈 [3-2사분면] 혼잡지표 비교 (혼잡도 vs 혼잡빈도강도)")
 
@@ -1068,10 +1033,10 @@ with col3:
                     cols = list(zip(*gdf_vis["daily_value"].apply(_color_from_value)))
                     gdf_vis["color_r"], gdf_vis["color_g"], gdf_vis["color_b"] = cols[0], cols[1], cols[2]
 
-                    # ⬇︎ 추가: 링크 전용 툴팁 HTML 생성
+                    # 링크 전용 툴팁 HTML
                     gdf_vis["tooltip_html"] = (
-                            "<b>링크:</b> " + gdf_vis["link_id_norm"].astype(str) +
-                            "<br/><b>일평균 혼잡도:</b> " + gdf_vis["daily_value"].round(1).astype(str) + "%"
+                        "<b>링크:</b> " + gdf_vis["link_id_norm"].astype(str) +
+                        "<br/><b>일평균 혼잡도:</b> " + gdf_vis["daily_value"].round(1).astype(str) + "%"
                     )
 
                     # 4) 세션 저장 (일평균)
@@ -1081,9 +1046,6 @@ with col3:
         except Exception as e:
             st.session_state["matched_links_geojson_daily"] = None
             st.info(f"일평균 혼잡도 GeoJSON 생성 오류: {e}")
-
-
-
 
 # ================================================================
 # 🗺️ 1–2사분면 단일 렌더 블록 (daily → hourly → points/highlight)
@@ -1127,10 +1089,6 @@ with col12_left:
         )
     )
 
-
-
-
-
 # -------------------------------------------------------------
 # 💡 4사분면 · 시나리오/재무/민감도/리포트 (업그레이드 버전)
 # -------------------------------------------------------------
@@ -1140,6 +1098,10 @@ with col4:
     # ---------------------------
     # 0) 공통 유틸
     # ---------------------------
+    def simple_npv(rate: float, cashflows):
+        """ t=1부터 할인하는 단순 NPV (억원 단위 cashflows 가정) """
+        return float(sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cashflows, start=1)))
+
     def calc_kpis(
         households:int,
         avg_py:float,                 # 전용평형(평)
@@ -1157,6 +1119,7 @@ with col4:
         m2_per_py = 3.3058
         avg_m2 = avg_py * m2_per_py
         sellable_m2 = households * avg_m2 * (1 - non_sale_ratio)  # 분양면적
+
         # 혼잡도 개선 (간이 모델)
         predicted_cong = max(0.0, congestion_base * (1 - bus_inc_pct / 150))
         cong_improve = max(0.0, congestion_base - predicted_cong)
@@ -1172,7 +1135,7 @@ with col4:
 
         # 간이 NPV (균등현금흐름 가정)
         cf_annual = profit_bil / years
-        npv = sum([cf_annual / ((1+disc_rate)**t) for t in range(1, years+1)])
+        npv = simple_npv(disc_rate, [cf_annual] * years)  # 👈 numpy_financial 없이 계산
         payback = min(years, max(1, int(np.ceil(total_cost_bil / max(1e-6, cf_annual)))))
 
         return {
@@ -1230,8 +1193,6 @@ with col4:
             "C": dict(sale=saleC, cost=costC, bus=busC, infra=infraC),
         }
 
-        # KPI 계산 & 비교표
-        import pandas as pd
         rows = []
         for name, s in scenarios.items():
             k = calc_kpis(
@@ -1265,7 +1226,6 @@ with col4:
             return calc_kpis(households, avg_py, sale, cost, infra, congestion_base, bus,
                              non_sale_ratio, sale_rate, disc_rate, years)["NPV(억원)"]
 
-        import numpy as np, altair as alt
         base_npv = kpi_with(base_sale, base_cost, base_bus, base_infra)
         factors = []
         for name, (lo, hi) in {
@@ -1307,6 +1267,10 @@ with col4:
         rng = np.random.default_rng(42)
         sale_samples = rng.normal(loc=base_sale, scale=base_sale*sigma_sale/100, size=n)
         cost_samples = rng.normal(loc=base_cost, scale=base_cost*sigma_cost/100, size=n)
+
+        def kpi_with(sale, cost, bus, infra):
+            return calc_kpis(households, avg_py, sale, cost, infra, congestion_base, bus,
+                             non_sale_ratio, sale_rate, disc_rate, years)["NPV(억원)"]
 
         npvs = []
         for s, c in zip(sale_samples, cost_samples):
