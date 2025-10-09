@@ -14,13 +14,15 @@ if str(BASE_DIR) not in sys.path:
 # ---------------------------------------------------------------------------
 
 import streamlit as st
+import numpy_financial as npf
 import pandas as pd
 import numpy as np
 import pydeck as pdk
 import altair as alt
 import geopandas as gpd
 
-from components.sidebar_faq import render_sidebar_faq
+from components.sidebar_presets import render_sidebar_presets
+from components.sidebar_4quadrant_guide import render_sidebar_4quadrant_guide
 import streamlit as st
 
 
@@ -469,8 +471,8 @@ st.sidebar.markdown(
 project_name = st.sidebar.text_input("프로젝트 이름", value=f"{selected_gu} 재건축 시나리오")
 
 # 사이드바 FAQ 렌더
-render_sidebar_faq()
-
+render_sidebar_presets()
+render_sidebar_4quadrant_guide()
 
 # -------------------------------------------------------------
 # 🗺️ 1-2사분면: 지도 + 단지 선택
@@ -478,7 +480,7 @@ render_sidebar_faq()
 col12_left, col12_right = st.columns([2.2, 1.4], gap="large")
 
 with col12_left:
-    st.markdown("### 🗺 1-2사분면 · 지도 & 단지선택")
+    st.markdown("### 🗺 [1-2사분면] · 지도 & 단지선택")
 
     base_df = get_projects_by_gu(selected_gu)
     df_map = merge_projects_with_coords(selected_gu)
@@ -728,6 +730,12 @@ if st.session_state.selected_row is None:
     st.stop()
 selected_row = st.session_state.selected_row
 
+
+# ✅ 4사분면 연동용 세션 설정
+selected_site_name = df_map.loc[selected_row, "name"]
+st.session_state["selected_site"] = selected_site_name
+
+
 # ✅ 지도 데이터/레이어 만들기 (selected_row 확정 이후)
 filtered_indices = edited["orig_index"].tolist()
 map_data = df_map.loc[filtered_indices].reset_index(drop=True)
@@ -785,7 +793,7 @@ tooltip = {
 
 
 with col12_right:
-    st.markdown("### 🧾 1사분면 · 기존 단지 정보")
+    st.markdown("### 🧾 [1사분면] · 기존 단지 정보")
     current = df_map.loc[selected_row]
     with st.container(border=True):
         st.markdown("**기존 단지 정보**")
@@ -820,7 +828,7 @@ def _to_norm_str_id(s):
     )
 
 with col3:
-    st.markdown("### 🚦 3사분면 · 주변 도로 혼잡도 (기준년도)")
+    st.markdown("### 🚦 [3-1사분면] · 주변 도로 혼잡도 (기준년도)")
 
     radius = st.slider("반경(m)", 500, 3000, 1000, step=250, key="radius_m")
     max_links = st.slider("표시 링크 수", 5, 20, 10, step=1, key="max_links")
@@ -889,7 +897,7 @@ with col3:
 
                 # === 혼잡도 / 혼잡빈도강도 토글 그래프 ===
     if 'df_plot' in locals() and df_plot is not None and not df_plot.empty:
-        st.markdown("### 📈 혼잡지표 비교 (혼잡도 vs 혼잡빈도강도)")
+        st.markdown("### 📈 [3-2사분면] 혼잡지표 비교 (혼잡도 vs 혼잡빈도강도)")
 
         def compute_congestion_from_speed(df_plot):
             d = df_plot.copy()
@@ -1119,102 +1127,263 @@ with col12_left:
         )
     )
 
+
+
+
+
 # -------------------------------------------------------------
-# 💡 4사분면 · 신설조건 입력 + 기대효과 + 리포트 (중복 key 해결 버전)
+# 💡 4사분면 · 시나리오/재무/민감도/리포트 (업그레이드 버전)
 # -------------------------------------------------------------
 with col4:
-    st.markdown("### 🧾 4사분면 · 신설조건 입력 및 기대효과")
+    st.markdown("### 🧾 [4사분면] · 시나리오 & 재무/민감도 & 리포트")
 
-    st.markdown("**🏗️ 재건축 단지 조건 입력**")
-    with st.expander("📋 조건 설정", expanded=True):
-        # 전용평형 입력 (건설사 내부 추정 or 계획안 기준)
-        desired_py = st.number_input(
-            "전용평형 (평)",
-            min_value=10.0,
-            max_value=60.0,
-            value=25.0,
-            step=1.0,
-            key="desired_py_4q",
-            help="단지 평균 전용면적(평)을 입력합니다. 예: 25평형, 34평형 등"
-        )
+    # ---------------------------
+    # 0) 공통 유틸
+    # ---------------------------
+    def calc_kpis(
+        households:int,
+        avg_py:float,                 # 전용평형(평)
+        sale_price_per_m2:float,      # 분양가 (만원/㎡)
+        build_cost_per_m2:float,      # 공사비 (만원/㎡)
+        infra_invest_billion:float,   # 교통 등 인프라 투자(억원)
+        congestion_base:float,        # 기준 혼잡도(%)
+        bus_inc_pct:int,              # 버스 증편(%)
+        non_sale_ratio:float=0.15,    # 비분양 비율(공공/커뮤니티 등)
+        sale_rate:float=0.98,         # 분양률
+        disc_rate:float=0.07,         # 할인율
+        years:int=4                   # 회수기간(년)
+    ):
+        # 면적 환산
+        m2_per_py = 3.3058
+        avg_m2 = avg_py * m2_per_py
+        sellable_m2 = households * avg_m2 * (1 - non_sale_ratio)  # 분양면적
+        # 혼잡도 개선 (간이 모델)
+        predicted_cong = max(0.0, congestion_base * (1 - bus_inc_pct / 150))
+        cong_improve = max(0.0, congestion_base - predicted_cong)
 
-        # 버스 용량 (혼잡도 산정용)
-        bus_capacity = st.number_input(
-            "버스 1대 정원 (명)",
-            min_value=10,
-            max_value=100,
-            value=45,
-            step=1,
-            key="bus_capacity_4q"
-        )
+        # 매출/비용 (만원 단위 -> 억원 환산)
+        revenue_won = sellable_m2 * sale_price_per_m2 * sale_rate  # (만원)
+        cost_won = sellable_m2 * build_cost_per_m2                 # (만원)
+        total_cost_bil = cost_won/1e4/100 + infra_invest_billion   # (억원)
+        total_rev_bil  = revenue_won/1e4/100                       # (억원)
 
-        # 대중교통 증설 비율 (가상 변수)
-        bus_increase_ratio = st.slider(
-            "버스 증편 비율 (%)",
-            0,
-            100,
-            20,
-            step=5,
-            key="bus_increase_ratio_4q"
-        )
+        profit_bil = total_rev_bil - total_cost_bil
+        margin_pct = (profit_bil / total_cost_bil * 100) if total_cost_bil>0 else 0
 
-        # 교통 개선비용 (가상 변수)
-        infra_invest_cost = st.number_input(
-            "교통 인프라 투자비용 (억원)",
-            min_value=0.0,
-            max_value=500.0,
-            value=50.0,
-            step=5.0,
-            key="infra_invest_cost_4q"
-        )
+        # 간이 NPV (균등현금흐름 가정)
+        cf_annual = profit_bil / years
+        npv = sum([cf_annual / ((1+disc_rate)**t) for t in range(1, years+1)])
+        payback = min(years, max(1, int(np.ceil(total_cost_bil / max(1e-6, cf_annual)))))
 
-    st.markdown("---")
-
-    # KPI 계산 (가상 모델)
-    st.markdown("### 📊 KPI 결과")
-
-    # 기본 혼잡도 예측 (세션에서 평균 혼잡도 가져옴)
-    base_congestion = st.session_state.get("avg_congestion", 50.0)
-
-    # 단순 효과 모델 (버스 증편율로 혼잡도 개선, 투자비 대비 수익률 계산)
-    predicted_congestion = max(0, base_congestion * (1 - bus_increase_ratio / 150))
-    expected_margin_billion = max(0, (100 - predicted_congestion) * (bus_increase_ratio / 10)) - infra_invest_cost
-
-    # KPI 출력
-    kpi1, kpi2 = st.columns(2)
-    kpi1.metric("예상 혼잡도(%)", f"{predicted_congestion:.1f} %", delta=f"{base_congestion - predicted_congestion:.1f} ↓")
-    kpi2.metric("총 기대 수익", f"{expected_margin_billion:.1f} 십억 원")
-
-    # 세션 반영
-    st.session_state["predicted_congestion"] = predicted_congestion
-    st.session_state["expected_margin_billion"] = expected_margin_billion
-    st.session_state["desired_py"] = desired_py
-
-    st.markdown("---")
-
-    # PDF 리포트 저장 기능
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
-
-    def generate_pdf_report(kpi_data):
-        pdf_path = "AIoT_Dashboard_Report.pdf"
-        styles = getSampleStyleSheet()
-        doc = SimpleDocTemplate(pdf_path, pagesize=A4)
-        content = [
-            Paragraph("AIoT 스마트 인프라 대시보드 리포트", styles["Title"]),
-            Spacer(1, 12),
-            Paragraph(f"예상 혼잡도: {kpi_data['predicted_congestion']:.1f} %", styles["Normal"]),
-            Paragraph(f"총 기대 수익: {kpi_data['expected_margin_billion']:.1f} 십억 원", styles["Normal"]),
-            Paragraph(f"평형(전용): {kpi_data['desired_py']} 평", styles["Normal"]),
-        ]
-        doc.build(content)
-        st.success("📄 PDF 리포트가 생성되었습니다! (AIoT_Dashboard_Report.pdf)")
-
-    if st.button("🧾 PDF 리포트 저장"):
-        kpi_data = {
-            "predicted_congestion": predicted_congestion,
-            "expected_margin_billion": expected_margin_billion,
-            "desired_py": desired_py,
+        return {
+            "분양면적(㎡)": sellable_m2,
+            "예상혼잡도(%)": round(predicted_cong,1),
+            "혼잡도개선(Δ%)": round(cong_improve,1),
+            "총매출(억원)": round(total_rev_bil,1),
+            "총사업비(억원)": round(total_cost_bil,1),
+            "이익(억원)": round(profit_bil,1),
+            "마진율(%)": round(margin_pct,1),
+            "NPV(억원)": round(npv,1),
+            "회수기간(년)": payback,
         }
-        generate_pdf_report(kpi_data)
+
+    # ---------------------------
+    # 1) 입력/시나리오 탭
+    # ---------------------------
+    tab1, tab2, tab3, tab4 = st.tabs(["🧩 입력·시나리오", "📈 민감도", "🎲 확률(간이)", "📤 리포트"])
+
+    with tab1:
+        st.markdown("#### 📋 공통 입력")
+        c1, c2 = st.columns(2)
+        with c1:
+            households = int(st.number_input("계획 세대수", 100, 10000, int(current.get("households") or 1000), step=50))
+            avg_py = st.number_input("평균 전용면적(평)", 10.0, 60.0, float(st.session_state.get("desired_py", 25.0)), 0.5)
+            congestion_base = st.number_input("기준 혼잡도(%)", 0.0, 100.0, 50.0, 1.0)
+            non_sale_ratio = st.slider("비분양 비율", 0.0, 0.4, 0.15, 0.01, help="공공/커뮤니티 등")
+        with c2:
+            sale_rate = st.slider("분양률", 0.80, 1.00, 0.98, 0.01)
+            disc_rate = st.slider("할인율(재무)", 0.03, 0.15, 0.07, 0.005)
+            years = st.slider("회수기간(년)", 2, 10, 4, 1)
+            base_bus_inc = st.slider("베이스라인 버스 증편(%)", 0, 100, 10, 5)
+
+        st.markdown("#### 🧪 시나리오 정의")
+        st.caption("분양가/공사비/버스증편/인프라투자만 다르게 하며, 나머지는 공통 입력을 상속합니다.")
+        def scenario_inputs(label, sale_default, cost_default, bus_default, infra_default):
+            a, b, c, d = st.columns(4, gap="small")
+            with a:
+                sale = st.number_input(f"{label}·분양가(만원/㎡)", 500.0, 3000.0, sale_default, 10.0, key=f"sale_{label}")
+            with b:
+                cost = st.number_input(f"{label}·공사비(만원/㎡)", 300.0, 2500.0, cost_default, 10.0, key=f"cost_{label}")
+            with c:
+                bus = st.slider(f"{label}·버스증편(%)", 0, 100, bus_default, 5, key=f"bus_{label}")
+            with d:
+                infra = st.number_input(f"{label}·인프라(억원)", 0.0, 1000.0, infra_default, 5.0, key=f"infra_{label}")
+            return sale, cost, bus, infra
+
+        saleA, costA, busA, infraA = scenario_inputs("A", 1200.0, 900.0, base_bus_inc, 30.0)
+        saleB, costB, busB, infraB = scenario_inputs("B", 1300.0, 950.0, base_bus_inc+10, 50.0)
+        saleC, costC, busC, infraC = scenario_inputs("C", 1100.0, 850.0, max(0, base_bus_inc-5), 20.0)
+
+        scenarios = {
+            "A": dict(sale=saleA, cost=costA, bus=busA, infra=infraA),
+            "B": dict(sale=saleB, cost=costB, bus=busB, infra=infraB),
+            "C": dict(sale=saleC, cost=costC, bus=busC, infra=infraC),
+        }
+
+        # KPI 계산 & 비교표
+        import pandas as pd
+        rows = []
+        for name, s in scenarios.items():
+            k = calc_kpis(
+                households, avg_py, s["sale"], s["cost"], s["infra"],
+                congestion_base, s["bus"], non_sale_ratio, sale_rate, disc_rate, years
+            )
+            rows.append({"시나리오": name, **k})
+        df_scn = pd.DataFrame(rows).set_index("시나리오")
+
+        st.markdown("#### 📊 시나리오 비교표")
+        st.dataframe(df_scn, use_container_width=True)
+
+        # 하이라이트 카드
+        best = df_scn.sort_values("NPV(억원)", ascending=False).head(1)
+        st.success(f"**추천 시나리오: {best.index[0]}** · NPV {best['NPV(억원)'].iloc[0]:,.1f}억원 · 마진율 {best['마진율(%)'].iloc[0]:.1f}%")
+
+    # ---------------------------
+    # 2) 민감도 (토네이도 차트)
+    # ---------------------------
+    with tab2:
+        st.markdown("#### 📈 민감도 분석 (토네이도)")
+        base_sale = st.number_input("기준 분양가(만원/㎡)", 500.0, 3000.0, 1200.0, 10.0)
+        base_cost = st.number_input("기준 공사비(만원/㎡)", 300.0, 2500.0, 900.0, 10.0)
+        base_bus  = st.slider("기준 버스증편(%)", 0, 100, 20, 5)
+        base_infra= st.number_input("기준 인프라(억원)", 0.0, 1000.0, 30.0, 5.0)
+
+        # ±변동폭
+        pct = st.slider("변동폭(±%)", 1, 30, 15, 1)
+
+        def kpi_with(sale, cost, bus, infra):
+            return calc_kpis(households, avg_py, sale, cost, infra, congestion_base, bus,
+                             non_sale_ratio, sale_rate, disc_rate, years)["NPV(억원)"]
+
+        import numpy as np, altair as alt
+        base_npv = kpi_with(base_sale, base_cost, base_bus, base_infra)
+        factors = []
+        for name, (lo, hi) in {
+            "분양가": (base_sale*(1-pct/100), base_sale*(1+pct/100)),
+            "공사비": (base_cost*(1-pct/100), base_cost*(1+pct/100)),
+            "버스증편": (max(0, base_bus-pct), min(100, base_bus+pct)),
+            "인프라": (max(0, base_infra*(1-pct/100)), base_infra*(1+pct/100)),
+        }.items():
+            npv_lo = kpi_with(lo if name=="분양가" else base_sale,
+                              lo if name=="공사비" else base_cost,
+                              lo if name=="버스증편" else base_bus,
+                              lo if name=="인프라" else base_infra)
+            npv_hi = kpi_with(hi if name=="분양가" else base_sale,
+                              hi if name=="공사비" else base_cost,
+                              hi if name=="버스증편" else base_bus,
+                              hi if name=="인프라" else base_infra)
+            factors.append({"요인": name, "NPV_low": npv_lo, "NPV_high": npv_hi})
+
+        df_tornado = pd.DataFrame(factors)
+        bars = alt.Chart(df_tornado).transform_fold(
+            ["NPV_low","NPV_high"], as_=["type","NPV"]
+        ).mark_bar().encode(
+            y=alt.Y("요인:N", sort=None),
+            x=alt.X("NPV:Q", title="NPV(억원)"),
+            color="type:N",
+            tooltip=["요인:N","NPV:Q"]
+        ).properties(height=200)
+        st.altair_chart(bars, use_container_width=True)
+
+    # ---------------------------
+    # 3) 확률(간이) Monte Carlo
+    # ---------------------------
+    with tab3:
+        st.markdown("#### 🎲 확률 분석 (간이 Monte Carlo)")
+        n = st.slider("시뮬레이션 반복수", 200, 5000, 1000, 100)
+        sigma_sale = st.slider("분양가 표준편차(%)", 1, 20, 7)
+        sigma_cost = st.slider("공사비 표준편차(%)", 1, 20, 5)
+
+        rng = np.random.default_rng(42)
+        sale_samples = rng.normal(loc=base_sale, scale=base_sale*sigma_sale/100, size=n)
+        cost_samples = rng.normal(loc=base_cost, scale=base_cost*sigma_cost/100, size=n)
+
+        npvs = []
+        for s, c in zip(sale_samples, cost_samples):
+            npvs.append(kpi_with(max(100, s), max(100, c), base_bus, base_infra))
+        ser = pd.Series(npvs)
+        p10, p50, p90 = np.percentile(ser, [10,50,90])
+
+        st.metric("P10 NPV", f"{p10:,.1f} 억원")
+        st.metric("P50 NPV", f"{p50:,.1f} 억원")
+        st.metric("P90 NPV", f"{p90:,.1f} 억원")
+        st.caption("※ P10: 보수적(하위 10%), P90: 낙관적(상위 10%)")
+
+        hist = alt.Chart(pd.DataFrame({"NPV": ser})).mark_bar().encode(
+            x=alt.X("NPV:Q", bin=alt.Bin(maxbins=30), title="NPV(억원)"),
+            y="count()"
+        ).properties(height=200)
+        st.altair_chart(hist, use_container_width=True)
+
+    # ---------------------------
+    # 4) 리포트/체크리스트
+    # ---------------------------
+    with tab4:
+        st.markdown("#### 🧷 행정 협의 체크리스트 (자동 생성)")
+        imp = float(df_scn.loc["A","혼잡도개선(Δ%)"]) if "A" in df_scn.index else 0.0
+        msg = []
+        if imp >= 5:
+            msg.append("• 교통영향평가 협의 시, **혼잡도 개선 Δ≥5%** 근거 제시 (버스 증편 + 노선 최적화)")
+        else:
+            msg.append("• 혼잡도 개선이 작음 → **정류장 위치/환승편의** 시뮬레이션 보완 권고")
+        if df_scn["마진율(%)"].max() < 10:
+            msg.append("• 마진율 낮음 → 공사비 단가/평형 믹스/비분양 비율 재검토 권고")
+        if df_scn["NPV(억원)"].max() < 0:
+            msg.append("• NPV 음수 → 분양가 산정 재검토 또는 인프라 투자 축소 필요")
+        st.write("\n".join(msg))
+
+        st.markdown("#### 📤 내보내기")
+        export_df = df_scn.reset_index()
+        st.download_button("⬇️ 시나리오 비교표(CSV)", data=export_df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="scenario_compare.csv", mime="text/csv")
+
+        # 간단 PDF (텍스트 위주)
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib import colors
+
+        def export_pdf_simple():
+            path = "AIoT_Biz_Analysis_Report.pdf"
+            styles = getSampleStyleSheet()
+            doc = SimpleDocTemplate(path, pagesize=A4)
+            story = [
+                Paragraph("AIoT 스마트 인프라 대시보드 — 사업성 분석 리포트", styles["Title"]),
+                Spacer(1, 12),
+                Paragraph(f"대상: {current.get('address_display','')}", styles["Normal"]),
+                Paragraph(f"자치구: {current.get('gu','')}", styles["Normal"]),
+                Spacer(1, 12),
+                Paragraph("시나리오 비교 요약", styles["Heading2"]),
+            ]
+            # 표 데이터
+            tbl_data = [export_df.columns.tolist()] + export_df.astype(str).values.tolist()
+            tbl = Table(tbl_data, repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.black),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.whitesmoke),
+                ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+                ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ]))
+            story += [tbl, Spacer(1, 12)]
+            story += [Paragraph("행정 협의 체크포인트", styles["Heading2"])]
+            for t in msg:
+                story += [Paragraph(t, styles["Normal"])]
+            story += [Spacer(1, 12), Paragraph("가정/파라미터 로그", styles["Heading2"])]
+            story += [Paragraph(f"세대수={households:,}, 평균전용={avg_py}평, 비분양={int(non_sale_ratio*100)}%, 분양률={int(sale_rate*100)}%", styles["Normal"])]
+            story += [Paragraph(f"할인율={disc_rate*100:.1f}%, 회수기간={years}년, 기준혼잡도={congestion_base}%", styles["Normal"])]
+            doc.build(story)
+            return path
+
+        if st.button("📄 PDF 리포트 다운로드"):
+            pdf_path = export_pdf_simple()
+            st.success(f"PDF 생성 완료: {pdf_path}")
