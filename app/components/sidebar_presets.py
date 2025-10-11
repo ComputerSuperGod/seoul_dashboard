@@ -78,7 +78,7 @@ def _show_preview(values: dict):
 
 def render_sidebar_presets():
     """사이드바: 예시값(프리셋) 선택 UI"""
-    with st.sidebar.expander("🧪 4사분면 예시값(프리셋)"):
+    with st.sidebar.expander("🧪 3사분면 예시값(프리셋)"):
         choice = st.radio(
             "데모/교육용으로 준비된 예시값을 선택하세요.",
             options=list(PRESETS.keys()),

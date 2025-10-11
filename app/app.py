@@ -15,6 +15,7 @@ if str(BASE_DIR) not in sys.path:
 
 import streamlit as st
 import numpy_financial as npf
+import json
 import pandas as pd
 import numpy as np
 import pydeck as pdk
@@ -34,6 +35,9 @@ if "matched_links_geojson" not in st.session_state:
     st.session_state["matched_links_geojson"] = None
 if "matched_links_geojson_daily" not in st.session_state:
     st.session_state["matched_links_geojson_daily"] = None
+# [넣을 위치 A] color_mode 기본값
+if "color_mode_daily_val" not in st.session_state:
+    st.session_state["color_mode_daily_val"] = "절대(30/70)"
 
 # === 외부 모듈 (utils) 임포트 ===
 from utils.traffic_preproc import ensure_speed_csv
@@ -203,6 +207,21 @@ def compute_cfi_soft(
     g["혼잡빈도강도(%)"] = g["혼잡빈도강도(%)"].clip(0, 100)
     g.attrs = {"boundary": vb, "mode": boundary_mode, "tau": tau}
     return g
+# === 색상 스케일: 절대/상대 선택 ===
+def color_by_value(v: float):
+    if pd.isna(v): return (200,200,200)
+    v = float(v)
+    if v < 30:   return (0, 200, 0)       # 초록
+    if v < 70:   return (255, 200, 0)     # 노랑
+    return (255, 0, 0)                    # 빨강
+
+def color_by_quantile(v: float, q30: float, q70: float):
+    if pd.isna(v): return (200,200,200)
+    if v < q30:   return (0, 200, 0)
+    if v < q70:   return (255, 200, 0)
+    return (255, 0, 0)
+
+
 
 @st.cache_data(show_spinner=False)
 def load_coords() -> pd.DataFrame:
@@ -805,10 +824,17 @@ with col12_right:
             f"- 정비구역면적: **{int(current['land_area_m2']):,} m²**"
         )
 
-# 3–4사분면 레이아웃 컬럼
-col3, col4 = st.columns([1.6, 1.4], gap="large")
+    # ✅ 여기 두 줄 추가: (1) 라디오 놓을 자리 (2) 범례 자리
+    color_controls_slot = st.container()
+    legend_slot = st.empty()
 
-# === 3사분면: 혼잡도 그래프 ===
+
+
+# 3–4사분면 레이아웃 컬럼
+# ✅ 아래 왼쪽(3사분면)=col4, 아래 오른쪽(4사분면)=col3
+col4, col3 = st.columns([1.6, 1.4], gap="large")
+
+# === 4-1사분면: 혼잡도 그래프 ===
 with st.spinner("교통 기준년도 데이터 준비 중..."):
     if TRAFFIC_XLSX_PATH.exists():
         ensure_speed_csv(TRAFFIC_XLSX_PATH, TRAFFIC_CSV_PATH)
@@ -828,261 +854,169 @@ def _to_norm_str_id(s):
     )
 
 with col3:
-    st.markdown("### 🚦 [3-1사분면] · 주변 도로 혼잡도 (기준년도)")
+    st.markdown("### 🚦 [4-1사분면] · 주변 도로 혼잡도 (기준년도)")
 
     radius = st.slider("반경(m)", 500, 3000, 1000, step=250, key="radius_m")
-    max_links = st.slider("표시 링크 수", 5, 20, 10, step=1, key="max_links")
+    graph_topn = st.slider("그래프에 표시할 링크 수 (Top-N)", 5, 50, 10, 1, key="graph_topn")
 
-    df_plot = None
+    df_plot_all = None
+
+    # ✅ A) 그래프용 — 평균속도 Top-N만 표시
     if TRAFFIC_CSV_PATH.exists() and SHP_PATH.exists():
         if _HAS_PLOT_SPEED:
-            chart_or_fig, df_plot = plot_speed(
+            chart_speed, df_speed = plot_speed(
                 csv_path=TRAFFIC_CSV_PATH,
                 shp_path=SHP_PATH,
                 center_lon=sel_lon,
                 center_lat=sel_lat,
                 radius_m=radius,
-                max_links=max_links,
+                max_links=graph_topn,  # 그래프: Top-N만
                 renderer="altair",
-                chart_height=700,
+                chart_height=280,
             )
-            # 🔸 지도 즉시 렌더하던 PathLayer/combined_layers 호출은 삭제(렌더 금지)
+            st.altair_chart(chart_speed, use_container_width=True, theme=None)
 
-            # Altair Chart이면 st.altair_chart()로 표시
-            if isinstance(chart_or_fig, alt.Chart):
-                st.altair_chart(chart_or_fig, use_container_width=True, theme=None)
-            else:
-                st.pyplot(chart_or_fig, use_container_width=True)
-        else:
-            fig, df_plot = plot_nearby_speed_from_csv(
+            # ✅ B) 지도용 — 반경 내 모든 링크 (혼잡도 계산용)
+            _, df_plot_all = plot_speed(
                 csv_path=TRAFFIC_CSV_PATH,
                 shp_path=SHP_PATH,
                 center_lon=sel_lon,
                 center_lat=sel_lat,
                 radius_m=radius,
-                max_links=max_links,
+                max_links=10000,  # 지도: 반경 내 전부
+                renderer="altair",
+                chart_height=1,  # 더미 (표시 안 함)
             )
-            st.pyplot(fig, use_container_width=True)
-
-        if df_plot is not None:
-            with st.expander("데이터 미리보기"):
-                st.dataframe(
-                    df_plot.sort_values(["link_id", "hour"]).head(300),
-                    use_container_width=True
-                )
-
-        # === 3사분면: 시간대 기준 결과 → SHP 매칭 → GeoJSON(시간대) 저장 ===
-        try:
-            if df_plot is not None and not df_plot.empty:
-                shp = gpd.read_file(SHP_PATH)[[LINK_ID_COL, "geometry"]]
-                if shp.crs is None or (shp.crs.to_epsg() != 4326):
-                    shp = shp.to_crs(epsg=4326)
-
-                shp["link_id_norm"] = (
-                    pd.to_numeric(shp[LINK_ID_COL], errors="coerce").round().astype("Int64").astype(str)
-                )
-                ids = (
-                    df_plot["link_id"].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()
-                )
-                link_gdf = shp[shp["link_id_norm"].isin(ids)].copy()
-
-                st.session_state["matched_links_geojson"] = link_gdf.__geo_interface__
-            else:
-                st.session_state["matched_links_geojson"] = None
-        except Exception as e:
-            st.session_state["matched_links_geojson"] = None
-            st.info(f"링크 매칭 중 오류: {e}")
+        else:
+            # fallback (plot_speed 불가 시)
+            _fig_ignored, df_plot_all = plot_nearby_speed_from_csv(
+                csv_path=TRAFFIC_CSV_PATH,
+                shp_path=SHP_PATH,
+                center_lon=sel_lon,
+                center_lat=sel_lat,
+                radius_m=radius,
+                max_links=10000,
+            )
     else:
-        st.info("교통 CSV 또는 SHP가 없어 그래프를 생략합니다.")
+        st.info("교통 CSV 또는 SHP가 없어 그래프/지도 데이터를 만들 수 없습니다.")
 
-                # === 혼잡도 / 혼잡빈도강도 토글 그래프 ===
-    if 'df_plot' in locals() and df_plot is not None and not df_plot.empty:
-        st.markdown("### 📈 [3-2사분면] 혼잡지표 비교 (혼잡도 vs 혼잡빈도강도)")
+    # === 혼잡도 계산 ===
+    if (df_plot_all is not None) and (not df_plot_all.empty):
+        st.markdown("### 📈 [4-2사분면] 혼잡지표 (혼잡도)")
 
+        # 혼잡도 계산
         def compute_congestion_from_speed(df_plot):
             d = df_plot.copy()
             d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
             d["free_flow"] = d.groupby("link_id")["평균속도(km/h)"].transform("max").clip(lower=1)
             d["혼잡도(%)"] = ((1 - (d["평균속도(km/h)"] / d["free_flow"]).clip(0, 1)) * 100).clip(0, 100)
-            d["지표명"] = "혼잡도"
-            return d[["link_id", "hour", "혼잡도(%)", "지표명"]]
+            return d.rename(columns={"혼잡도(%)": "value"})[["link_id", "hour", "value"]]
 
-        def compute_congestion_freq_intensity(df_plot, boundary_speed=30):
-            d = df_plot.copy()
-            d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
-            d["혼잡빈도강도(%)"] = (d["평균속도(km/h)"] <= boundary_speed).astype(int) * 100
-            d = d.groupby(["link_id", "hour"], as_index=False)["혼잡빈도강도(%)"].mean()
-            d["지표명"] = "혼잡빈도강도"
-            return d
+        df_metric_all = compute_congestion_from_speed(df_plot_all)
+        y_title = "혼잡도 (0=자유주행, 100=매우혼잡)"
 
-        def compute_cfi_weighted_robust(
-                speed_df: pd.DataFrame,
-                vol_df: pd.DataFrame,
-                boundary_mode: str = "percentile",
-                boundary_value: float = 30.0,
-                min_samples: int = 1
-        ):
-            d = speed_df.copy()
-            d["link_id"] = d["link_id"].astype(str)
-            d["hour"] = pd.to_numeric(d["hour"], errors="coerce").astype("Int64")
-            d["평균속도(km/h)"] = pd.to_numeric(d["평균속도(km/h)"], errors="coerce")
-
-            v = vol_df.copy()
-            v["link_id"] = v["link_id"].astype(str)
-            v["hour"] = pd.to_numeric(v["hour"], errors="coerce").astype("Int64") % 24
-            v["차량대수"] = pd.to_numeric(v["차량대수"], errors="coerce").fillna(0)
-
-            m = d.merge(v, on=["link_id", "hour"], how="inner").dropna(subset=["평균속도(km/h)"])
-
-            if boundary_mode == "percentile":
-                p = float(boundary_value)
-                p = max(5.0, min(95.0, p))
-                boundary = np.nanpercentile(m["평균속도(km/h)"], p)
-            else:
-                boundary = float(boundary_value)
-
-            m["혼잡차량수"] = (m["평균속도(km/h)"] <= boundary).astype(int) * m["차량대수"]
-
-            g = (m.groupby(["link_id", "hour"], as_index=False)
-                 .agg(전체차량수=("차량대수", "sum"),
-                      혼잡차량수=("혼잡차량수", "sum")))
-
-            g.loc[g["전체차량수"] < max(1, min_samples), ["혼잡차량수", "전체차량수"]] = np.nan
-            g["혼잡빈도강도(%)"] = (g["혼잡차량수"] / g["전체차량수"]) * 100
-            g["혼잡빈도강도(%)"] = g["혼잡빈도강도(%)"].fillna(0).clip(0, 100)
-
-            g.attrs = {"boundary": boundary, "mode": boundary_mode}
-            return g
-
-        metric_choice = st.radio(
-            "표시할 혼잡지표 선택",
-            ["혼잡도", "혼잡빈도강도"],
-            horizontal=True,
-            index=0,
-            key="metric_toggle"
+        # 일평균 계산
+        df_daily = (
+            df_metric_all.groupby("link_id", as_index=False)["value"].mean()
+            .rename(columns={"value": "daily_value"})
+        )
+        df_daily["link_id_norm"] = (
+            pd.Series(df_daily["link_id"], dtype="object")
+            .astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
         )
 
-        if metric_choice == "혼잡도":
-            df_metric = compute_congestion_from_speed(df_plot).rename(columns={"혼잡도(%)": "value"})
-            y_title = "혼잡도 (0=자유주행, 100=매우혼잡)"
-        else:
-            vol_path = DATA_DIR / "TrafficVolume_Seoul_2023.csv"
-            if vol_path.exists():
-                vol_norm = load_volume_csv(vol_path)
-                bcol1, bcol2, bcol3 = st.columns([1, 1, 1])
-                with bcol1:
-                    boundary_mode = st.radio("경계방식", ["percentile", "fixed"], horizontal=True, index=0, key="bd_mode")
-                with bcol2:
-                    if boundary_mode == "percentile":
-                        boundary_value = float(st.slider("속도분포 분위수(%)", 10, 90, 40, 5, key="bd_pct"))
-                    else:
-                        boundary_value = float(st.number_input("고정 경계속도(km/h)", 10.0, 100.0, 30.0, 1.0, key="bd_fix"))
-                with bcol3:
-                    band_kmh = float(st.slider("완화 밴드폭 (km/h)", 5, 20, 10, 1, key="bd_band"))
+        gdf_link = gpd.read_file(SHP_PATH)[[LINK_ID_COL, "geometry"]]
+        if gdf_link.crs and gdf_link.crs.to_epsg() != 4326:
+            gdf_link = gdf_link.to_crs(epsg=4326)
+        gdf_link["link_id_norm"] = (
+            gdf_link[LINK_ID_COL].astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+        )
 
-                df_cfi = compute_cfi_soft(
-                    df_plot, vol_norm,
-                    boundary_mode=boundary_mode,
-                    boundary_value=boundary_value,
-                    tau_kmh=band_kmh
-                )
-                used_boundary = getattr(df_cfi, "attrs", {}).get("boundary", None)
-                if used_boundary is not None:
-                    st.caption(f"사용된 경계속도 ≈ {used_boundary:.1f} km/h (밴드폭 {band_kmh:.1f} km/h)")
+        gdf_vis = gdf_link.merge(df_daily, on="link_id_norm", how="inner")
 
-                df_metric = df_cfi.rename(columns={"혼잡빈도강도(%)": "value"})
-                y_title = "혼잡빈도강도 (교통량 가중 · Soft)"
+        # === 지도 색 기준 (단 1개만 사용, 키 고유화) ===
+        # ✅ (교체) — 라디오를 1사분면 아래의 slot에 렌더
+        with color_controls_slot:
+            color_mode_key = f"color_mode_daily__{selected_gu}"
+            st.radio(
+                "지도 색 기준",
+                ["절대(30/70)", "상대(30%/70%)"],
+                index=0,
+                horizontal=True,
+                key=color_mode_key,
+            )
+            st.caption("절대: 30/70 고정 · 상대: 반경 내 분포의 30/70 분위수")
+
+        # 선택값 세션에서 꺼내 쓰기
+        color_mode = st.session_state.get(color_mode_key, "절대(30/70)")
+        st.session_state["color_mode_daily_val"] = color_mode
+
+        # 색상 계산 분기 (그대로 사용)
+        if not gdf_vis.empty:
+            if color_mode.startswith("상대"):
+                q30 = float(np.nanpercentile(gdf_vis["daily_value"], 30))
+                q70 = float(np.nanpercentile(gdf_vis["daily_value"], 70))
+                cols = list(zip(*gdf_vis["daily_value"].apply(lambda x: color_by_quantile(x, q30, q70))))
             else:
-                df_metric = compute_congestion_freq_intensity(df_plot).rename(columns={"혼잡빈도강도(%)": "value"})
-                y_title = "혼잡빈도강도 (혼잡구간 차량비율)"
+                cols = list(zip(*gdf_vis["daily_value"].apply(color_by_value)))
+            gdf_vis["color_r"], gdf_vis["color_g"], gdf_vis["color_b"] = cols[0], cols[1], cols[2]
+            gdf_vis["tooltip_html"] = (
+                    "<b>링크:</b> " + gdf_vis["link_id_norm"].astype(str)
+                    + "<br/><b>일평균 혼잡도:</b> " + gdf_vis["daily_value"].round(1).astype(str) + "%"
+            )
+            st.session_state["matched_links_geojson_daily"] = json.loads(gdf_vis.to_json())
+        else:
+            st.session_state["matched_links_geojson_daily"] = None
 
-        CHART_H = 400
-        HALF_W = 1100
+        # ✅ 범례도 1사분면 아래의 legend_slot에 출력
+        if st.session_state.get("matched_links_geojson_daily"):
+            cmode = st.session_state.get("color_mode_daily_val", "절대(30/70)")
+            legend_text = "🟩 <30% 분위 · 🟨 30~70% · 🟥 ≥70%" if cmode.startswith("상대") \
+                else "🟩 <30 · 🟨 30~70 · 🟥 ≥70 (단위: %)"
+            legend_slot.caption(legend_text)
+
+
+
+        # === 그래프: Top-N 링크만 ===
+        rank = (
+            df_metric_all.groupby("link_id", as_index=False)["value"].mean()
+            .sort_values("value", ascending=False)
+            .head(graph_topn)
+        )
+        keep = set(rank["link_id"].astype(str))
+        df_metric_chart = df_metric_all[df_metric_all["link_id"].astype(str).isin(keep)].copy()
 
         chart = (
-            alt.Chart(df_metric)
+            alt.Chart(df_metric_chart)
             .mark_line(point=True)
             .encode(
                 x=alt.X("hour:Q", title="시간대 (시)"),
                 y=alt.Y("value:Q", title=y_title, scale=alt.Scale(domain=[0, 100])),
-                color=alt.Color(
-                    "link_id:N",
-                    title="링크 ID",
-                    legend=alt.Legend(orient="bottom", direction="horizontal", columns=4),
-                ),
+                color=alt.Color("link_id:N", title="링크 ID",
+                                legend=alt.Legend(orient="bottom", direction="horizontal", columns=4)),
                 tooltip=[
                     alt.Tooltip("link_id:N", title="링크"),
                     alt.Tooltip("hour:Q", title="시"),
                     alt.Tooltip("value:Q", title=y_title, format=".1f"),
                 ],
             )
-            .properties(title=f"{metric_choice} 변화 추이", width=HALF_W, height=CHART_H)
+            .properties(title=f"혼잡도 변화 추이 — Top {graph_topn}", width=1000, height=400)
             .configure_view(strokeWidth=0)
         )
         st.altair_chart(chart, use_container_width=False, theme=None)
 
-        if metric_choice == "혼잡도":
-            st.markdown("### 🧮 혼잡도(%) 정의")
-            st.markdown("- 링크 $(l)$, 시간대 $(h)$에서의 평균속도를 $v_{l,h}$ 라 할 때,")
-            st.latex(r"v_{\mathrm{ff},l}=\max v_{l,h}")
-            st.latex(r"\mathrm{혼잡도}_{l,h}(\%)=\Big(1-\min\big(1,\frac{v_{l,h}}{v_{\mathrm{ff},l}}\big)\Big)\times 100")
-            st.markdown("- 값의 의미: **0% = 자유주행**, **100% = 매우 혼잡**")
-        else:
-            st.markdown("### 🧮 혼잡빈도강도(%) 정의 (교통량 가중 · Soft)")
-            st.markdown("- 경계속도 $v_b$ 부근에서 부드럽게 전환되는 시그모이드 확률로 혼잡 여부를 근사합니다.")
-            st.latex(r"p_{\mathrm{cong}}(v)=\frac{1}{1+\exp\!\left(\frac{v-v_b}{\tau}\right)}")
-            st.markdown("- 링크·시간대별 혼잡빈도강도는 **교통량 가중 평균**으로 계산합니다.")
-            st.latex(r"""\mathrm{CFI}_{l,h}(\%)=100\times
-            \frac{\sum_i w_{l,h,i}\,p_{\mathrm{cong}}(v_{l,h,i})}{\sum_i w_{l,h,i}}""")
-            st.markdown("- 여기서 $w$는 차량대수, $\\tau$는 전환의 부드러움을 제어하는 밴드폭(km/h)입니다.")
-
-        # === [MAKE DAILY GEOJSON] 3사분면 df_metric → 일평균 GeoJSON 저장 (렌더 금지) ===
-        def _color_from_value(v):
-            if pd.isna(v): return (200, 200, 200)
-            v = float(v)
-            if v < 30:   return (0, 200, 0)       # 초록
-            if v < 70:   return (255, 200, 0)     # 노랑
-            return (255, 0, 0)                    # 빨강
-
-        try:
-            if df_metric is not None and not df_metric.empty and SHP_PATH.exists():
-                # 1) 일평균 집계
-                df_daily = (
-                    df_metric.groupby("link_id", as_index=False)["value"]
-                             .mean()
-                             .rename(columns={"value": "daily_value"})
-                )
-                df_daily["link_id_norm"] = _to_norm_str_id(df_daily["link_id"])
-
-                # 2) SHP 매칭
-                gdf_link = gpd.read_file(SHP_PATH)[[LINK_ID_COL, "geometry"]]
-                if gdf_link.crs and gdf_link.crs.to_epsg() != 4326:
-                    gdf_link = gdf_link.to_crs(epsg=4326)
-                gdf_link["link_id_norm"] = (
-                    pd.to_numeric(gdf_link[LINK_ID_COL], errors="coerce").round().astype("Int64").astype(str)
-                )
-                gdf_vis = gdf_link.merge(df_daily, on="link_id_norm", how="inner")
-
-                if not gdf_vis.empty:
-                    # 3) GeoJSON properties에 색상값 추가
-                    cols = list(zip(*gdf_vis["daily_value"].apply(_color_from_value)))
-                    gdf_vis["color_r"], gdf_vis["color_g"], gdf_vis["color_b"] = cols[0], cols[1], cols[2]
-
-                    # ⬇︎ 추가: 링크 전용 툴팁 HTML 생성
-                    gdf_vis["tooltip_html"] = (
-                            "<b>링크:</b> " + gdf_vis["link_id_norm"].astype(str) +
-                            "<br/><b>일평균 혼잡도:</b> " + gdf_vis["daily_value"].round(1).astype(str) + "%"
-                    )
-
-                    # 4) 세션 저장 (일평균)
-                    st.session_state["matched_links_geojson_daily"] = gdf_vis.__geo_interface__
-                else:
-                    st.session_state["matched_links_geojson_daily"] = None
-        except Exception as e:
-            st.session_state["matched_links_geojson_daily"] = None
-            st.info(f"일평균 혼잡도 GeoJSON 생성 오류: {e}")
-
-
+        # === 정의 설명 ===
+        st.markdown("### 🧮 혼잡도(%) 정의")
+        st.markdown("- 링크 $(l)$, 시간대 $(h)$에서의 평균속도를 $v_{l,h}$ 라 할 때,")
+        st.latex(r"v_{\mathrm{ff},l}=\max v_{l,h}")
+        st.latex(r"\mathrm{혼잡도}_{l,h}(\%)=\Big(1-\min\big(1,\frac{v_{l,h}}{v_{\mathrm{ff},l}}\big)\Big)\times 100")
+        st.markdown("- 값의 의미: **0% = 자유주행**, **100% = 매우 혼잡**")
+    else:
+        st.info("혼잡도 데이터를 계산할 수 없습니다.")
 
 
 # ================================================================
@@ -1132,10 +1066,10 @@ with col12_left:
 
 
 # -------------------------------------------------------------
-# 💡 4사분면 · 시나리오/재무/민감도/리포트 (업그레이드 버전)
+# 💡 3사분면 · 시나리오/재무/민감도/리포트 (업그레이드 버전)
 # -------------------------------------------------------------
 with col4:
-    st.markdown("### 🧾 [4사분면] · 시나리오 & 재무/민감도 & 리포트")
+    st.markdown("### 🧾 [3사분면] · 시나리오 & 재무/민감도 & 리포트")
 
     # ---------------------------
     # 0) 공통 유틸
@@ -1294,6 +1228,7 @@ with col4:
             tooltip=["요인:N","NPV:Q"]
         ).properties(height=200)
         st.altair_chart(bars, use_container_width=True)
+
 
     # ---------------------------
     # 3) 확률(간이) Monte Carlo

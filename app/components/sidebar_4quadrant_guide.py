@@ -1,9 +1,9 @@
 import streamlit as st
 
 def render_sidebar_4quadrant_guide():
-    with st.sidebar.expander("🧭 4사분면 구조 요약", expanded=False):
+    with st.sidebar.expander("🧭 3사분면 구조 요약", expanded=False):
         st.markdown("""
-        **AIoT 스마트 인프라 대시보드**의 4사분면은  
+        **AIoT 스마트 인프라 대시보드**의 3사분면은  
         입력값 → 분석결과 → 인사이트로 이어지는 구조입니다.
         ---
         """)
