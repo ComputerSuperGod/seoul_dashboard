@@ -12,3 +12,6 @@ rtree
 matplotlib
 
 openpyxl
+numpy_financial
+reportlab
+
