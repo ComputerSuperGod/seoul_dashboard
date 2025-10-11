@@ -1,17 +1,29 @@
-
+# --- 기본 유틸 ---
 requests
 python-dotenv
 pyarrow
 
+# --- 데이터 처리 ---
+pandas
+numpy
+openpyxl
+numpy_financial
+
+# --- 공간 데이터 (GIS) ---
 geopandas
 shapely
 fiona
 pyproj
 rtree
 
+# --- 시각화 ---
 matplotlib
+altair
+pydeck
+plotly
 
-openpyxl
-numpy_financial
+# --- 웹 대시보드 ---
+streamlit
+
+# --- PDF / 보고서 ---
 reportlab
-
